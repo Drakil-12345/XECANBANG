@@ -1,0 +1,31 @@
+# Build artifacts
+Debug/
+Release/
+*.elf
+*.list
+*.map
+*.o
+*.d
+*.su
+*.cyclo
+
+# CubeIDE
+.settings/
+.mxproject
+*.launch
+.metadata/
+*.log
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# Local workspace
+*.workspace
+*.worpace
