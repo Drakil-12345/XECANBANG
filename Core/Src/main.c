@@ -73,7 +73,7 @@ volatile int32_t g_auto_arm      = 1;   /* 1 = tu ARM khi giu thang dung ~1s
 volatile float   g_kp            = 0.0f;   /* de 0 -> dung gain tu Balance_Init */
 volatile float   g_kd            = 0.0f;   /* de 0 -> dung Balance_Init         */
 volatile float   g_deadband      = 0.0f;   /* de 0 -> dung Balance_Init         */
-volatile int32_t g_trim_left     = 180;    /* bu luc banh trai                */
+volatile int32_t g_trim_left     = 100;    /* bu luc banh trai — giam         */
 volatile int32_t g_trim_right    = 0;      /* bu luc banh phai                */
 volatile float   g_target_angle  = 0.0f;   /* offset goc can bang              */
 volatile int32_t g_spd_loop_en   = 1;      /* vong toc do BAT mac dinh          */
