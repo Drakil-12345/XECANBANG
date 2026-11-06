@@ -76,19 +76,55 @@ volatile float   g_deadband      = 0.0f;   /* de 0 -> dung Balance_Init         
 volatile int32_t g_trim_left     = 100;    /* bu luc banh trai — giam         */
 volatile int32_t g_trim_right    = 0;      /* bu luc banh phai                */
 volatile float   g_target_angle  = 0.0f;   /* offset goc can bang              */
-volatile int32_t g_spd_loop_en   = 1;      /* vong toc do BAT mac dinh          */
-volatile float   g_spd_kp        = 0.0f;   /* de 0 -> dung Balance_Init         */
-volatile float   g_spd_ki        = 0.0f;   /* de 0 -> dung Balance_Init         */
+volatile int32_t g_spd_loop_en   = 0;      /* vong toc do TAT — chi PD          */
+volatile float   g_spd_kp        = 0.0f;
+volatile float   g_spd_ki        = 0.0f;
+volatile int32_t g_pos_loop_en   = 0;      /* vong vi tri TAT — chi PD          */
+volatile float   g_pos_kp        = 0.0f;
+volatile float   g_pos_ki        = 0.0f;
+volatile float   g_pos_max_deg   = 4.0f;
 
 uint32_t last_time = 0;
 uint32_t arm_ms    = 0;
 uint8_t  imu_fail  = 0;
 
 /* Gia tri mac dinh tu Balance_Init — ghi truc tiep vao g_balance khi debug */
-volatile float b_kp_default     = 35.0f;
-volatile float b_kd_default     = 8.0f;
-volatile float b_deadband_def   = 200.0f;
-volatile float b_spd_kp_default = 0.02f;
+/* ===================== LOG REAL-TIME (ring buffer) =====================
+ * Moi chu ky dieu khien ghi 1 ban ghi vao vong dem. Dung debugger doc:
+ *   g_log_idx     -> chi so ghi tiep theo (vong)
+ *   g_log[N].angle, .rate, .control, .target, .spd, .error, .status
+ *   g_log_count   -> tong so mau da ghi
+ * Khi xe chay xong, pause debugger va doc g_log[] de phan tich.       */
+#define LOG_SIZE   250u     /* ~1 giay du lieu @250Hz */
+typedef struct {
+  float   angle;
+  float   rate;
+  float   control;
+  float   target;
+  float   spd;
+  float   error;
+  uint8_t status;
+  uint8_t tune_ok;
+} LogEntry_t;
+
+volatile LogEntry_t g_log[LOG_SIZE];
+volatile uint32_t   g_log_idx   = 0;
+volatile uint32_t   g_log_count = 0;
+
+/* Snapshot tong hop: chi can doc g_diag la du de tune, khong can nhieu bien */
+typedef struct {
+  float angle, rate, control, target, spd, error;
+  float max_angle_abs, max_rate_abs, max_spd_abs;
+  uint8_t tune_ok, armed, status, connected, valid, calibrated;
+  uint32_t err_count, total_err, last_hal_err;
+  float gyro_x_dps, angle_acc;
+} DiagSnapshot_t;
+volatile DiagSnapshot_t g_diag;
+
+volatile float b_kp_default     = 35.0f;   /* kp vua du -> khong saturate     */
+volatile float b_kd_default     = 25.0f;   /* kd MANH -> ham dao dong         */
+volatile float b_deadband_def   = 80.0f;   /* deadband nho -> khong giat      */
+volatile float b_spd_kp_default = 0.05f;   /* P toc do                        */
 volatile float b_spd_ki_default = 0.0f;
 /* USER CODE END PV */
 
@@ -162,7 +198,7 @@ int main(void)
   HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
   Motor_Init(&g_motor, &htim9);
-  Motor_SetPwmLimit(&g_motor, 3000);   /* gioi han ~36% — nhu cu truoc         */
+  Motor_SetPwmLimit(&g_motor, 2500);   /* gioi han ~30% — mem, khong saturate  */
   Motor_SetInvert(&g_motor, false, true); /* banh PHAI nguoc (quay lai khi tien) */
   Motor_SetTrim(&g_motor, 150, 0);        /* bu luc banh trai (yeu hon)    */
 
@@ -223,6 +259,8 @@ int main(void)
     Encoder_Update(&g_enc_right, DT_S);
     /* Toc do trung binh 2 banh (counts/s) cho vong dieu khien toc do */
     Balance_SetWheelSpeed(&g_balance, 0.5f * (g_enc_left.speed_cps + g_enc_right.speed_cps));
+    /* Vi tri trung binh 2 banh (counts tich luy) cho vong vi tri */
+    Balance_SetPosition(&g_balance, 0.5f * ((float)g_enc_left.count_total + (float)g_enc_right.count_total));
 
     /* ---------- Test motor truc tiep (bypass, chi khi DISARM) ---------- */
     if (g_motor_test != 0 && !g_balance.armed && !g_auto_arm) {
@@ -281,6 +319,10 @@ int main(void)
     g_balance.spd_kp       = (g_spd_kp != 0.0f) ? g_spd_kp : b_spd_kp_default;
     g_balance.spd_ki       = (g_spd_ki != 0.0f) ? g_spd_ki : b_spd_ki_default;
     g_balance.spd_loop_en  = (g_spd_loop_en != 0);
+    g_balance.pos_kp       = (g_pos_kp != 0.0f) ? g_pos_kp : 0.005f;
+    g_balance.pos_ki       = (g_pos_ki != 0.0f) ? g_pos_ki : 0.0f;
+    g_balance.pos_max_deg  = g_pos_max_deg;
+    g_balance.pos_loop_en  = (g_pos_loop_en != 0);
 
     if (g_state == ST_RUN && g_balance.armed) {
       float ang = g_imu.angle;
@@ -289,6 +331,40 @@ int main(void)
       Balance_Update(&g_balance, &g_imu, &g_motor);
     }
     /* state ST_IDLE / ST_FAULT: khong lam gi, motor da tat */
+
+    /* ---------- Ghi log moi chu ky ---------- */
+    g_log[g_log_idx].angle   = g_balance.log_angle;
+    g_log[g_log_idx].rate    = g_balance.log_rate;
+    g_log[g_log_idx].control = g_balance.log_control;
+    g_log[g_log_idx].target  = g_balance.log_target;
+    g_log[g_log_idx].spd     = g_balance.log_spd;
+    g_log[g_log_idx].error   = g_balance.log_error;
+    g_log[g_log_idx].status  = g_balance.log_status;
+    g_log[g_log_idx].tune_ok = g_balance.log_tune_ok;
+    g_log_idx = (g_log_idx + 1u) % LOG_SIZE;
+    g_log_count++;
+
+    /* ---------- Snapshot tong hop cho debug ---------- */
+    g_diag.angle         = g_balance.log_angle;
+    g_diag.rate          = g_balance.log_rate;
+    g_diag.control       = g_balance.log_control;
+    g_diag.target        = g_balance.log_target;
+    g_diag.spd           = g_balance.log_spd;
+    g_diag.error         = g_balance.log_error;
+    g_diag.max_angle_abs = g_balance.max_angle_abs;
+    g_diag.max_rate_abs  = g_balance.max_rate_abs;
+    g_diag.max_spd_abs   = g_balance.max_spd_abs;
+    g_diag.tune_ok       = g_balance.tune_ok;
+    g_diag.armed         = g_balance.armed ? 1 : 0;
+    g_diag.status        = (uint8_t)g_balance.status;
+    g_diag.connected     = g_imu.connected ? 1 : 0;
+    g_diag.valid         = g_imu.valid ? 1 : 0;
+    g_diag.calibrated    = g_imu.calibrated ? 1 : 0;
+    g_diag.err_count     = g_imu.err_count;
+    g_diag.total_err     = g_imu.total_err;
+    g_diag.last_hal_err  = g_imu.last_hal_err;
+    g_diag.gyro_x_dps    = g_imu.gyro_x_dps;
+    g_diag.angle_acc     = g_imu.angle_acc;
   }
   /* USER CODE END WHILE */
 
