@@ -51,6 +51,12 @@ typedef struct {
   uint16_t pwm_max;              /* nguong PWM toi da cho phep (<= MOTOR_PWM_ABS_MAX) */
   int16_t  cmd_left;             /* lenh cuoi cung da gui (co dau, da gioi han) */
   int16_t  cmd_right;
+
+  /* Trim bu luc cho tung motor (PWM cong them theo dau).
+   * Vi motor hop so co ma sat khac nhau -> mot ben yeu hon. Khi lenh khac 0,
+   * cong them trim_<side> vao magnitude de bu yeu. Dat bang thi nghiem.   */
+  int16_t  trim_left;
+  int16_t  trim_right;
 } Motor_Handle_t;
 
 /* ===================== API ===================== */
@@ -105,6 +111,12 @@ void Motor_SetInvert(Motor_Handle_t *m, bool invert_left, bool invert_right);
  *        Bat dau thap (vi du 2000-3000) khi chua xac minh dong co.
  */
 void Motor_SetPwmLimit(Motor_Handle_t *m, uint16_t pwm_max);
+
+/**
+ * @brief Dat trim bu luc cho tung motor (PWM cong them khi lenh != 0).
+ *        Dung khi mot ben yeu hon — trim_left > 0 bu them cho trai.
+ */
+void Motor_SetTrim(Motor_Handle_t *m, int16_t trim_left, int16_t trim_right);
 
 #ifdef __cplusplus
 }

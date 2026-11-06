@@ -35,7 +35,7 @@
 #define ARM_ANGLE_DEG   10.0f       /* chi ARM khi gan thang dung */
 #define ARM_GYRO_DPS    40.0f       /* ...va gan nhu dung yen */
 #define ARM_HOLD_MS     1000U       /* giu lien tuc 1s */
-#define TILT_CUTOFF_DEG 35.0f       /* nghieng qua -> cat motor */
+#define TILT_CUTOFF_DEG 50.0f       /* nghieng qua -> cat motor */
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
@@ -56,7 +56,7 @@ Balance_t        g_balance;
 
 /* Trang thai he thong (giong code chay duoc) */
 typedef enum { ST_IDLE = 0, ST_RUN = 1, ST_FAULT = 2 } SysState_t;
-volatile SysState_t g_state = ST_IDLE;
+volatile SysState_t g_state = ST_RUN;
 
 /* Bien chinh/hieu chinh qua debugger (Live Expressions):
  *   g_arm_request = 1 -> ARM; 0 -> DISARM
@@ -67,13 +67,29 @@ volatile SysState_t g_state = ST_IDLE;
 volatile int32_t g_arm_request   = 0;
 volatile int32_t g_calib_request = 0;
 volatile int32_t g_motor_test    = 0;
-volatile int32_t g_auto_arm      = 0;
-volatile float   g_kp            = 0.0f;
-volatile float   g_kd            = 0.0f;
+volatile int32_t g_auto_arm      = 1;   /* 1 = tu ARM khi giu thang dung ~1s
+                                         * -> chi can cap nguon + dung xe,
+                                         * khong can debugger van chay duoc.  */
+volatile float   g_kp            = 0.0f;   /* de 0 -> dung gain tu Balance_Init */
+volatile float   g_kd            = 0.0f;   /* de 0 -> dung Balance_Init         */
+volatile float   g_deadband      = 0.0f;   /* de 0 -> dung Balance_Init         */
+volatile int32_t g_trim_left     = 180;    /* bu luc banh trai                */
+volatile int32_t g_trim_right    = 0;      /* bu luc banh phai                */
+volatile float   g_target_angle  = 0.0f;   /* offset goc can bang              */
+volatile int32_t g_spd_loop_en   = 1;      /* vong toc do BAT mac dinh          */
+volatile float   g_spd_kp        = 0.0f;   /* de 0 -> dung Balance_Init         */
+volatile float   g_spd_ki        = 0.0f;   /* de 0 -> dung Balance_Init         */
 
 uint32_t last_time = 0;
 uint32_t arm_ms    = 0;
 uint8_t  imu_fail  = 0;
+
+/* Gia tri mac dinh tu Balance_Init — ghi truc tiep vao g_balance khi debug */
+volatile float b_kp_default     = 35.0f;
+volatile float b_kd_default     = 8.0f;
+volatile float b_deadband_def   = 200.0f;
+volatile float b_spd_kp_default = 0.02f;
+volatile float b_spd_ki_default = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,7 +162,9 @@ int main(void)
   HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
   Motor_Init(&g_motor, &htim9);
-  Motor_SetPwmLimit(&g_motor, 3000);   /* gioi han an toan ~36% */
+  Motor_SetPwmLimit(&g_motor, 3000);   /* gioi han ~36% — nhu cu truoc         */
+  Motor_SetInvert(&g_motor, false, true); /* banh PHAI nguoc (quay lai khi tien) */
+  Motor_SetTrim(&g_motor, 150, 0);        /* bu luc banh trai (yeu hon)    */
 
   Encoder_Init(&g_enc_left,  &htim3, false);
   Encoder_Init(&g_enc_right, &htim2, true);
@@ -203,6 +221,8 @@ int main(void)
     /* ---------- Encoder ---------- */
     Encoder_Update(&g_enc_left,  DT_S);
     Encoder_Update(&g_enc_right, DT_S);
+    /* Toc do trung binh 2 banh (counts/s) cho vong dieu khien toc do */
+    Balance_SetWheelSpeed(&g_balance, 0.5f * (g_enc_left.speed_cps + g_enc_right.speed_cps));
 
     /* ---------- Test motor truc tiep (bypass, chi khi DISARM) ---------- */
     if (g_motor_test != 0 && !g_balance.armed && !g_auto_arm) {
@@ -247,21 +267,25 @@ int main(void)
     if (want_arm && !g_balance.armed && g_state != ST_FAULT) {
       Motor_Enable(&g_motor);
       Balance_Arm(&g_balance);
-      g_balance.kp = g_kp;     /* cap nhat he so tu debugger */
-      g_balance.kd = g_kd;
       g_state = ST_RUN;
     }
 
     /* ---------- An toan + dieu khien ---------- */
+    /* Cap nhat kp/kd/deadband + trim lien tuc tu bien debug */
+    g_balance.kp           = (g_kp != 0.0f) ? g_kp : b_kp_default;
+    g_balance.kd           = (g_kd != 0.0f) ? g_kd : b_kd_default;
+    g_balance.deadband     = (g_deadband != 0.0f) ? g_deadband : b_deadband_def;
+    g_balance.target_angle = g_target_angle;
+    g_motor.trim_left      = (int16_t)g_trim_left;
+    g_motor.trim_right     = (int16_t)g_trim_right;
+    g_balance.spd_kp       = (g_spd_kp != 0.0f) ? g_spd_kp : b_spd_kp_default;
+    g_balance.spd_ki       = (g_spd_ki != 0.0f) ? g_spd_ki : b_spd_ki_default;
+    g_balance.spd_loop_en  = (g_spd_loop_en != 0);
+
     if (g_state == ST_RUN && g_balance.armed) {
-      /* Che do can bang */
       float ang = g_imu.angle;
       if (ang < 0) ang = -ang;
       if (ang > TILT_CUTOFF_DEG) { Enter_Idle(); continue; }
-
-      /* PD: cap nhat kp/kd truc tiep tu bien debug */
-      g_balance.kp = g_kp;
-      g_balance.kd = g_kd;
       Balance_Update(&g_balance, &g_imu, &g_motor);
     }
     /* state ST_IDLE / ST_FAULT: khong lam gi, motor da tat */

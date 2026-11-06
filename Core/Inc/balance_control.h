@@ -71,6 +71,9 @@ typedef struct {
   float angle_limit_deg;  /* nguong goc an toan (disarm neu vuot)    */
   float rate_limit_dps;   /* nguong van toc goc bat thuong (deg/s)   */
   int16_t pwm_limit;      /* gioi han PWM dau ra (<= motor pwm_max)  */
+  float   deadband;       /* bu vung chet motor (PWM): lenh |u|>0 thi cong
+                           * them deadband de vuot ma sat nhớt. Do bang
+                           * thi nghiem: tang dan den khi banh bat dau quay. */
 
   float control_out;      /* dau ra tinh duoc (PWM, co dau, da gioi han) */
   float angle_now;        /* goc hien tai (deg)      */
@@ -81,6 +84,22 @@ typedef struct {
   uint32_t run_cycles;    /* dem so chu ky dieu khien da chay         */
   uint32_t missed_cycles; /* dem so lan xu ly cham / miss deadline    */
   uint32_t max_missed;    /* nguong overrun truoc khi fault timing     */
+
+  /* Vong ngoai: toc do banh -> goc muc tieu (giup xe tu ham, khong trôi) */
+  float spd_f;            /* toc do banh trung binh (counts/s, da loc)  */
+  float spd_int;          /* tich phan toc do                          */
+  float spd_kp;           /* he so P vong toc do (do / (counts/s))      */
+  float spd_ki;           /* he so I vong toc do                        */
+  float spd_max_deg;      /* goc lech toi da do vong toc do tao ra      */
+  bool  spd_loop_en;      /* bat vong toc do khi da on dinh vong goc    */
+
+  /* Danh gia chat luong can bang tu dong (khong can nguoi do) */
+  uint8_t  tune_ok;       /* 1 = dang can bang on dinh trong cua so do  */
+  uint8_t  tune_ok_cnt;   /* so chu ky lien tiep dat nguong can bang    */
+  float    max_angle_abs; /* |angle| lon nhat trong cua so 1s gan nhat  */
+  float    max_rate_abs;  /* |rate| lon nhat trong cua so 1s gan nhat   */
+  float    max_spd_abs;   /* |spd_f| lon nhat trong cua so 1s gan nhat  */
+  uint16_t ok_window;     /* do rong cua so danh gia (chu ky, ~1s)      */
 } Balance_t;
 
 /* ===================== API ===================== */
@@ -112,6 +131,14 @@ void Balance_Disarm(Balance_t *b);
  * @note  Neu fault -> tu dong Disarm + cat motor, tra ve ma loi.
  */
 Balance_Status_t Balance_Update(Balance_t *b, MPU6050_Data_t *imu, Motor_Handle_t *mot);
+
+/**
+ * @brief Cap nhat toc do banh trung binh (tu encoder) cho vong ngoai.
+ *        Goi tu main loop moi chu ky truoc Balance_Update.
+ * @param b    bo dieu khien
+ * @param spd  toc do trung binh (counts/s) cua 2 encoder
+ */
+void Balance_SetWheelSpeed(Balance_t *b, float spd);
 
 /**
  * @brief Bao cho bo dieu khien biet co chu ky bi lo (overrun).

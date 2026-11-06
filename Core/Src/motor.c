@@ -40,6 +40,8 @@ void Motor_Init(Motor_Handle_t *m, TIM_HandleTypeDef *htim9)
   m->pwm_max      = MOTOR_PWM_ABS_MAX;   /* nguoi dung nen giam khi test dau */
   m->cmd_left     = 0;
   m->cmd_right    = 0;
+  m->trim_left    = 0;
+  m->trim_right   = 0;
 
   /* An toan: STBY LOW, chieu brake, duty 0 */
   HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
@@ -88,6 +90,7 @@ void Motor_Stop(Motor_Handle_t *m)
 /* Ham loi chung: ap dung invert + gioi han + xuat GPIO/PWM cho 1 kenh */
 static void apply(Motor_Handle_t *m,
                   bool invert,
+                  int16_t trim,
                   GPIO_TypeDef *p_in1, uint16_t pin_in1,
                   GPIO_TypeDef *p_in2, uint16_t pin_in2,
                   uint32_t channel,
@@ -106,6 +109,10 @@ static void apply(Motor_Handle_t *m,
   int32_t v = value;
   if (invert) v = -v;
 
+  /* Trim bu luc: khi lenh khac 0, cong them trim theo dau de bu motor yeu hon */
+  if (v > 0)       v += trim;
+  else if (v < 0)  v -= trim;
+
   /* Gioi han */
   if (v >  m->pwm_max) v =  m->pwm_max;
   if (v < -m->pwm_max) v = -m->pwm_max;
@@ -123,14 +130,14 @@ static void apply(Motor_Handle_t *m,
 
 void Motor_SetLeft(Motor_Handle_t *m, int16_t value)
 {
-  apply(m, m->invert_left,
+  apply(m, m->invert_left, m->trim_left,
         AIN1_GPIO_Port, AIN1_Pin, AIN2_GPIO_Port, AIN2_Pin,
         m->ch_left, value, &m->cmd_left);
 }
 
 void Motor_SetRight(Motor_Handle_t *m, int16_t value)
 {
-  apply(m, m->invert_right,
+  apply(m, m->invert_right, m->trim_right,
         BIN1_GPIO_Port, BIN1_Pin, BIN2_GPIO_Port, BIN2_Pin,
         m->ch_right, value, &m->cmd_right);
 }
@@ -156,4 +163,10 @@ void Motor_SetPwmLimit(Motor_Handle_t *m, uint16_t pwm_max)
   if (m->cmd_left  < -(int16_t)pwm_max) Motor_SetLeft(m, -pwm_max);
   if (m->cmd_right >  (int16_t)pwm_max) Motor_SetRight(m,  pwm_max);
   if (m->cmd_right < -(int16_t)pwm_max) Motor_SetRight(m, -pwm_max);
+}
+
+void Motor_SetTrim(Motor_Handle_t *m, int16_t trim_left, int16_t trim_right)
+{
+  m->trim_left  = trim_left;
+  m->trim_right = trim_right;
 }
