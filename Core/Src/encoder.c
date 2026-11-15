@@ -1,79 +1,71 @@
-/**
-  ******************************************************************************
-  * @file    encoder.c
-  * @brief   Doc encoder TIM3 (trai, 16-bit) va TIM2 (phai, 32-bit). Xem encoder.h.
-  ******************************************************************************
-  */
 #include "encoder.h"
+#include <stddef.h>
+#include <string.h>
 
-void Encoder_Init(Encoder_Handle_t *e, TIM_HandleTypeDef *htim, bool is_32)
+#define ENCODER_SPEED_FILTER_ALPHA 0.30f
+
+void Encoder_Init(Encoder_Handle_t *e, TIM_HandleTypeDef *htim, bool invert)
 {
-  e->htim        = htim;
-  e->is_32bit    = is_32;
-  e->invert      = false;
-  e->count_total = 0;
-  e->count_prev  = 0;
-  e->delta       = 0;
-  e->speed_cps   = 0.0f;
+    if (e == NULL) return;
 
-  /* Reset counter ve giua de tranh tran ngay khi bat dau (chi can cho 16-bit) */
-  __HAL_TIM_SET_COUNTER(htim, 0);
-  HAL_TIM_Encoder_Start(htim, TIM_CHANNEL_ALL);
+    memset(e, 0, sizeof(*e));
+    e->htim = htim;
+    e->invert = invert;
 
-  e->count_prev = (int32_t)__HAL_TIM_GET_COUNTER(htim);
+    if (htim == NULL) return;
+
+    if (HAL_TIM_Encoder_Start(htim, TIM_CHANNEL_ALL) == HAL_OK)
+    {
+        e->started = true;
+        e->previous_count = __HAL_TIM_GET_COUNTER(htim);
+    }
 }
 
-/* Doc counter voi kieu du lieu phu hop, xu ly tran/wrap dung cach */
-static int32_t read_counter(Encoder_Handle_t *e)
+void Encoder_Update(Encoder_Handle_t *e, float dt_s)
 {
-  if (e->is_32bit) {
-    return (int32_t)__HAL_TIM_GET_COUNTER(e->htim);   /* 32-bit: cast truc tiep */
-  } else {
-    return (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(e->htim); /* 16-bit: sign-extend */
-  }
-}
+    uint32_t current_count;
+    int32_t delta;
 
-void Encoder_Update(Encoder_Handle_t *e, float dt)
-{
-  int32_t now = read_counter(e);
-  int32_t diff;
+    if ((e == NULL) || (e->htim == NULL) || !e->started ||
+        (dt_s < 0.001f) || (dt_s > 0.020f))
+    {
+        if (e != NULL)
+        {
+            e->delta_counts = 0;
+            e->speed_raw_cps = 0.0f;
+        }
+        return;
+    }
 
-  if (e->is_32bit) {
-    diff = now - e->count_prev;   /* 32-bit: tru truc tiep, wrap tu xu ly */
-  } else {
-    /* 16-bit: wrap nam trong int16; tru roi sign-extend */
-    diff = (int16_t)(now - e->count_prev);
-  }
+    current_count = __HAL_TIM_GET_COUNTER(e->htim);
 
-  e->count_prev = now;
+    if (e->htim->Init.Period > 0xFFFFU)
+    {
+        /* 32-bit timer (TIM2): signed subtraction naturally handles wraparound. */
+        delta = (int32_t)(current_count - e->previous_count);
+    }
+    else
+    {
+        /* 16-bit timer (TIM3): signed 16-bit subtraction handles wraparound. */
+        delta = (int16_t)((uint16_t)current_count - (uint16_t)e->previous_count);
+    }
 
-  if (e->invert) diff = -diff;
+    e->previous_count = current_count;
+    if (e->invert) delta = -delta;
 
-  e->delta        = diff;
-  e->count_total += diff;
-
-  if (dt > 0.0f) {
-    e->speed_cps = (float)diff / dt;   /* counts per second */
-  }
-}
-
-int64_t Encoder_GetCount(const Encoder_Handle_t *e)
-{
-  return e->count_total;
-}
-
-int32_t Encoder_GetDelta(const Encoder_Handle_t *e)
-{
-  return e->delta;
+    e->delta_counts = delta;
+    e->count_total += delta;
+    e->speed_raw_cps = (float)delta / dt_s;
+    e->speed_cps += ENCODER_SPEED_FILTER_ALPHA *
+                    (e->speed_raw_cps - e->speed_cps);
 }
 
 void Encoder_Reset(Encoder_Handle_t *e)
 {
-  e->count_total = 0;
-  e->delta       = 0;
-}
-
-void Encoder_SetInvert(Encoder_Handle_t *e, bool invert)
-{
-  e->invert = invert;
+    if (e == NULL || e->htim == NULL) return;
+    e->previous_count = __HAL_TIM_GET_COUNTER(e->htim);
+    e->delta_counts = 0;
+    e->count_total = 0;
+    e->speed_raw_cps = 0.0f;
+    e->speed_cps = 0.0f;
 }

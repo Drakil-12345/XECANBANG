@@ -1,200 +1,235 @@
-/**
-  ******************************************************************************
-  * @file    mpu6050.c
-  * @brief   Driver MPU6050 qua I2C2 + Complementary Filter goc nghieng.
-  *          THEO DUNG MO HINH CODE DA CHUNG MINH CHAY DUOC.
-  ******************************************************************************
-  */
 #include "mpu6050.h"
+#include <stddef.h>
 #include <math.h>
 #include <string.h>
 
-#define RAD2DEG  (180.0f / 3.14159265358979f)
-#define MPU6050_ADDR8   (0x68 << 1)   /* dia chi 8-bit nhu code chay duoc */
+#define MPU_REG_SMPLRT_DIV       0x19U
+#define MPU_REG_CONFIG           0x1AU
+#define MPU_REG_GYRO_CONFIG      0x1BU
+#define MPU_REG_ACCEL_CONFIG     0x1CU
+#define MPU_REG_ACCEL_XOUT_H     0x3BU
+#define MPU_REG_GYRO_XOUT_H      0x43U
+#define MPU_REG_WHO_AM_I         0x75U
+#define MPU_REG_PWR_MGMT_1       0x6BU
+#define MPU_WHO_AM_I_VALUE       0x68U
 
-static I2C_HandleTypeDef *s_i2c = NULL;
-static uint32_t s_last_hal_err = 0;
+#define MPU_I2C_TIMEOUT_MS       3U
+#define MPU_RAD_TO_DEG           57.29577951308232f
+#define MPU_COMPLEMENTARY_ALPHA  0.02f
+#define MPU_ACCEL_NORM_MIN_SQ    0.5625f
+#define MPU_ACCEL_NORM_MAX_SQ    1.5625f
+#define MPU_MAX_CONSEC_ERRORS    3U
 
-/* ---------------------------------------------------------------------------*/
-bool MPU6050_Init(I2C_HandleTypeDef *hi2c, MPU6050_Data_t *d)
+/*
+ * angle_acc_raw = atan2(-ay, az) is a pitch angle in the sensor frame.
+ * With a right-handed MPU6050 axis system, the derivative of that angle is
+ * -gyro_x, NOT +gyro_x.  The complementary filter and the PD controller must
+ * use the same sign, otherwise the D term becomes positive feedback.
+ * Keep all pitch-rate consumers using gyro_x_dps (already sign-corrected).
+ */
+#define MPU_PITCH_RATE_SIGN      (-1.0f)
+
+static I2C_HandleTypeDef *s_hi2c = NULL;
+
+static bool write_register(uint8_t reg, uint8_t value)
 {
-  s_i2c = hi2c;
-  memset(d, 0, sizeof(*d));
-  d->connected  = false;
-  d->valid      = false;
-  d->calibrated = false;
-  d->whoami_ok  = false;
-
-  uint8_t cfg;
-  HAL_StatusTypeDef st = HAL_OK;
-
-  /* Giong code chay duoc: IsDeviceReady -> doc WHO_AM_I -> ghi config */
-  if (HAL_I2C_IsDeviceReady(s_i2c, MPU6050_ADDR8, 3, 50) != HAL_OK) {
-    d->last_hal_err = (uint32_t)HAL_I2C_GetError(s_i2c);
-    return false;
-  }
-
-  st |= HAL_I2C_Mem_Read(s_i2c, MPU6050_ADDR8, MPU6050_REG_WHO_AM_I,
-                         I2C_MEMADD_SIZE_8BIT, &d->who_am_i, 1, 50);
-  d->whoami_ok = (d->who_am_i == MPU6050_WHOAMI_EXPECTED);
-  if (!d->whoami_ok) { d->last_hal_err = s_last_hal_err; return false; }
-
-  cfg = 0x00; /* Exit sleep */
-  st |= HAL_I2C_Mem_Write(s_i2c, MPU6050_ADDR8, MPU6050_REG_PWR_MGMT_1,
-                          I2C_MEMADD_SIZE_8BIT, &cfg, 1, 50);
-  cfg = 0x08; /* Gyro +-500 dps */
-  st |= HAL_I2C_Mem_Write(s_i2c, MPU6050_ADDR8, MPU6050_REG_GYRO_CONFIG,
-                          I2C_MEMADD_SIZE_8BIT, &cfg, 1, 50);
-  cfg = 0x00; /* Accel +-2g -> /16384 */
-  st |= HAL_I2C_Mem_Write(s_i2c, MPU6050_ADDR8, MPU6050_REG_ACCEL_CONFIG,
-                          I2C_MEMADD_SIZE_8BIT, &cfg, 1, 50);
-  cfg = 0x03; /* DLPF ~44Hz */
-  st |= HAL_I2C_Mem_Write(s_i2c, MPU6050_ADDR8, MPU6050_REG_CONFIG,
-                          I2C_MEMADD_SIZE_8BIT, &cfg, 1, 50);
-
-  if (st != HAL_OK) { d->last_hal_err = s_last_hal_err; return false; }
-
-  d->connected = true;
-  d->valid     = true;
-  d->last_hal_err = s_last_hal_err;
-  return true;
+    return (HAL_I2C_Mem_Write(s_hi2c, MPU6050_I2C_ADDR8, reg,
+                              I2C_MEMADD_SIZE_8BIT, &value, 1U,
+                              MPU_I2C_TIMEOUT_MS) == HAL_OK);
 }
 
-/* ---------------------------------------------------------------------------*/
-/* Hieu chinh gyro khi dung yen — giong code chay duoc: doc gyro raw,          */
-/* kiem tra dung yen (stdv nho), retry toi da 5 lan.                            */
-/* ---------------------------------------------------------------------------*/
-bool MPU6050_Calibrate(MPU6050_Data_t *d, uint16_t samples, void (*delay_ms)(uint32_t))
+bool MPU6050_Init(I2C_HandleTypeDef *hi2c, MPU6050_Data_t *dev)
 {
-  (void)samples;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    float sum = 0.0f, sumsq = 0.0f;
-    int n = 0;
-    uint8_t b[6];
+    uint8_t who = 0U;
 
-    for (int i = 0; i < 200; i++) {
-      if (HAL_I2C_Mem_Read(s_i2c, MPU6050_ADDR8, 0x43 /* GYRO_XOUT_H */,
-                           I2C_MEMADD_SIZE_8BIT, b, 6, 50) == HAL_OK) {
-        float g = (int16_t)((b[0] << 8) | b[1]) / MPU6050_GYRO_LSB_PER_DPS;
-        sum += g; sumsq += g * g;
-        n++;
-      }
-      if (delay_ms) delay_ms(10);
+    if ((hi2c == NULL) || (dev == NULL)) return false;
+
+    s_hi2c = hi2c;
+    memset(dev, 0, sizeof(*dev));
+
+    if (HAL_I2C_IsDeviceReady(s_hi2c, MPU6050_I2C_ADDR8, 3U, 50U) != HAL_OK)
+    {
+        dev->last_hal_err = HAL_I2C_GetError(s_hi2c);
+        return false;
     }
-    if (n < 180) continue;
 
-    float mean = sum / (float)n;
-    float var  = sumsq / (float)n - mean * mean;
-    float stdv = sqrtf(var > 0.0f ? var : 0.0f);
-    if (stdv < 1.5f && fabsf(mean) < 20.0f) {
-      d->gyro_x_bias  = mean;
-      d->accel_y_bias = 0.0f;
-      d->angle_offset_deg = 0.0f;
-      d->angle_acc_raw    = 0.0f;
-      d->angle_acc        = 0.0f;
-      d->angle            = 0.0f;
-      d->calibrated       = true;
-      d->valid            = true;
-      return true;
+    if (HAL_I2C_Mem_Read(s_hi2c, MPU6050_I2C_ADDR8, MPU_REG_WHO_AM_I,
+                         I2C_MEMADD_SIZE_8BIT, &who, 1U, 50U) != HAL_OK)
+    {
+        dev->last_hal_err = HAL_I2C_GetError(s_hi2c);
+        return false;
     }
-  }
-  return false;
-}
 
-/* ---------------------------------------------------------------------------*/
-/* Doc 14 byte + complementary filter — THEO CODE CHAY DUOC.                   */
-/* pitch_acc = atan2f(-Ay, Az). Goc duoc hieu chinh chi khi |a| gan 1g.        */
-/* ---------------------------------------------------------------------------*/
-bool MPU6050_Update(MPU6050_Data_t *d, float dt)
-{
-  uint8_t buf[14];
+    dev->who_am_i = who;
+    dev->whoami_ok = (who == MPU_WHO_AM_I_VALUE);
+    if (!dev->whoami_ok) return false;
 
-  if (HAL_I2C_Mem_Read(s_i2c, MPU6050_ADDR8, MPU6050_REG_ACCEL_XOUT_H,
-                       I2C_MEMADD_SIZE_8BIT, buf, 14, 20) != HAL_OK) {
-    s_last_hal_err = (uint32_t)HAL_I2C_GetError(s_i2c);
-    d->last_hal_err = s_last_hal_err;
-    d->err_count++;
-    d->total_err++;
-    d->valid = false;
-    if (d->err_count >= MPU6050_MAX_ERR_RETRY) {
-      d->connected = false;
+    /* Wake up, gyro +/-500 dps, accel +/-2 g, DLPF ~44 Hz.
+     * Internal sample rate 1 kHz; the control loop reads it at 250 Hz, so
+     * the freshest sample is only ~1 ms old (SMPLRT_DIV=3 would add up to
+     * 4 ms of latency because the sensor would update at exactly the read
+     * rate). */
+    if (!write_register(MPU_REG_PWR_MGMT_1, 0x00U) ||
+        !write_register(MPU_REG_GYRO_CONFIG, 0x08U) ||
+        !write_register(MPU_REG_ACCEL_CONFIG, 0x00U) ||
+        !write_register(MPU_REG_CONFIG, 0x03U) ||
+        !write_register(MPU_REG_SMPLRT_DIV, 0x00U))
+    {
+        dev->last_hal_err = HAL_I2C_GetError(s_hi2c);
+        return false;
     }
-    return false;
-  }
 
-  d->connected = true;
-  d->err_count = 0;
-
-  d->ax_raw = (int16_t)((buf[0]  << 8) | buf[1]);
-  d->ay_raw = (int16_t)((buf[2]  << 8) | buf[3]);
-  d->az_raw = (int16_t)((buf[4]  << 8) | buf[5]);
-  d->gx_raw = (int16_t)((buf[8]  << 8) | buf[9]);
-  d->gy_raw = (int16_t)((buf[10] << 8) | buf[11]);
-  d->gz_raw = (int16_t)((buf[12] << 8) | buf[13]);
-
-  d->ax_g = d->ax_raw / MPU6050_ACCEL_LSB_PER_G;
-  d->ay_g = d->ay_raw / MPU6050_ACCEL_LSB_PER_G;
-  d->az_g = d->az_raw / MPU6050_ACCEL_LSB_PER_G;
-
-  d->gx_dps = (d->gx_raw / MPU6050_GYRO_LSB_PER_DPS) - d->gyro_x_bias;
-  d->gyro_x_dps = d->gx_dps;
-
-  /* Cong thuc goc da chung minh: atan2(-Ay, Az) */
-  d->angle_acc_raw = atan2f(-d->ay_g, d->az_g) * RAD2DEG;
-  d->angle_acc     = d->angle_acc_raw;
-
-  /* Complementary: 0.98*gyro + 0.02*accel, chi khi |a| gan 1g */
-  d->angle += d->gx_dps * dt;
-  float a_norm = sqrtf(d->ax_g*d->ax_g + d->ay_g*d->ay_g + d->az_g*d->az_g);
-  if (fabsf(a_norm - 1.0f) < 0.25f) {
-    d->angle += 0.02f * (d->angle_acc - d->angle);
-  }
-
-  d->valid = true;
-  return true;
+    dev->connected = true;
+    dev->valid = false;
+    dev->calibrated = false;
+    dev->angle_initialized = false;
+    dev->last_hal_err = HAL_OK;
+    return true;
 }
 
-/* ---------------------------------------------------------------------------*/
-void MPU6050_ResetAngle(MPU6050_Data_t *d)
+bool MPU6050_Calibrate(MPU6050_Data_t *dev,
+                       uint16_t samples,
+                       void (*delay_ms)(uint32_t))
 {
-  d->angle         = 0.0f;
-  d->angle_acc_raw = 0.0f;
-  d->angle_acc     = 0.0f;
+    uint16_t count;
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    uint16_t valid_samples = 0U;
+    uint8_t data[6];
+
+    if ((dev == NULL) || (s_hi2c == NULL) || !dev->connected) return false;
+
+    count = (samples > 0U) ? samples : MPU6050_CALIB_SAMPLES;
+
+    for (uint16_t i = 0U; i < count; i++)
+    {
+        if (HAL_I2C_Mem_Read(s_hi2c, MPU6050_I2C_ADDR8, MPU_REG_GYRO_XOUT_H,
+                             I2C_MEMADD_SIZE_8BIT, data, sizeof(data),
+                             20U) == HAL_OK)
+        {
+            int16_t raw_gx = (int16_t)(((uint16_t)data[0] << 8U) | data[1]);
+            float gx_dps = (float)raw_gx / MPU6050_GYRO_LSB_PER_DPS;
+            sum += gx_dps;
+            sum_sq += gx_dps * gx_dps;
+            valid_samples++;
+        }
+
+        if (delay_ms != NULL) delay_ms(5U);
+    }
+
+    if (valid_samples < (uint16_t)((count * 9U) / 10U))
+    {
+        dev->calibrated = false;
+        dev->valid = false;
+        return false;
+    }
+
+    {
+        float mean = sum / (float)valid_samples;
+        float variance = (sum_sq / (float)valid_samples) - (mean * mean);
+        float std_dev = sqrtf((variance > 0.0f) ? variance : 0.0f);
+
+        /* Calibration must be done while the robot is motionless. */
+        if ((std_dev >= 1.5f) || (fabsf(mean) >= 20.0f))
+        {
+            dev->calibrated = false;
+            dev->valid = false;
+            return false;
+        }
+
+        dev->gyro_x_bias = mean;
+    }
+
+    dev->calibrated = true;
+    dev->valid = false;
+    dev->angle_initialized = false;
+    dev->err_count = 0U;
+    return true;
 }
 
-/* Bus recovery — phat SCL pha lockup (chi goi tu main loop, khong trong chu ky) */
-bool MPU6050_BusRecover(MPU6050_Data_t *d)
+bool MPU6050_Update(MPU6050_Data_t *dev, float dt_s)
 {
-  GPIO_InitTypeDef gi = {0};
-  d->recoveries++;
+    uint8_t data[14];
+    float accel_norm_sq;
 
-  HAL_I2C_DeInit(s_i2c);
-  gi.Pin = GPIO_PIN_10; gi.Mode = GPIO_MODE_OUTPUT_OD; gi.Pull = GPIO_NOPULL; gi.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &gi);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET); HAL_Delay(1);
-  for (int i = 0; i < 16; i++) {
-    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_SET) break;
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET); HAL_Delay(1);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   HAL_Delay(1);
-  }
-  gi.Pin = GPIO_PIN_11; gi.Mode = GPIO_MODE_OUTPUT_OD;
-  HAL_GPIO_Init(GPIOB, &gi);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET); HAL_Delay(1);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   HAL_Delay(1);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);   HAL_Delay(1);
-  gi.Pin = GPIO_PIN_10 | GPIO_PIN_11; gi.Mode = GPIO_MODE_AF_OD;
-  gi.Pull = GPIO_NOPULL; gi.Speed = GPIO_SPEED_FREQ_VERY_HIGH; gi.Alternate = GPIO_AF4_I2C2;
-  HAL_GPIO_Init(GPIOB, &gi);
-  if (HAL_I2C_Init(s_i2c) != HAL_OK) return false;
-  HAL_Delay(5);
-  return (HAL_I2C_IsDeviceReady(s_i2c, MPU6050_ADDR8, 3, 50) == HAL_OK);
+    if ((dev == NULL) || (s_hi2c == NULL) || !isfinite(dt_s) ||
+        (dt_s < 0.001f) || (dt_s > 0.020f))
+    {
+        return false;
+    }
+
+    if (HAL_I2C_Mem_Read(s_hi2c, MPU6050_I2C_ADDR8, MPU_REG_ACCEL_XOUT_H,
+                         I2C_MEMADD_SIZE_8BIT, data, sizeof(data),
+                         MPU_I2C_TIMEOUT_MS) != HAL_OK)
+    {
+        dev->last_hal_err = HAL_I2C_GetError(s_hi2c);
+        if (dev->err_count < 255U) dev->err_count++;
+        dev->total_err++;
+        dev->valid = false;
+        if (dev->err_count >= MPU_MAX_CONSEC_ERRORS) dev->connected = false;
+        return false;
+    }
+
+    dev->connected = true;
+    dev->err_count = 0U;
+
+    dev->ax_raw = (int16_t)(((uint16_t)data[0] << 8U) | data[1]);
+    dev->ay_raw = (int16_t)(((uint16_t)data[2] << 8U) | data[3]);
+    dev->az_raw = (int16_t)(((uint16_t)data[4] << 8U) | data[5]);
+    dev->temp_raw = (int16_t)(((uint16_t)data[6] << 8U) | data[7]);
+    dev->gx_raw = (int16_t)(((uint16_t)data[8] << 8U) | data[9]);
+    dev->gy_raw = (int16_t)(((uint16_t)data[10] << 8U) | data[11]);
+    dev->gz_raw = (int16_t)(((uint16_t)data[12] << 8U) | data[13]);
+
+    dev->ax_g = (float)dev->ax_raw / MPU6050_ACCEL_LSB_PER_G;
+    dev->ay_g = (float)dev->ay_raw / MPU6050_ACCEL_LSB_PER_G;
+    dev->az_g = (float)dev->az_raw / MPU6050_ACCEL_LSB_PER_G;
+
+    /* Raw chip X rate (after bias). Kept for diagnostics. */
+    dev->gx_dps = ((float)dev->gx_raw / MPU6050_GYRO_LSB_PER_DPS) - dev->gyro_x_bias;
+
+    /* Pitch rate that matches the sign of angle_acc_raw (see MPU_PITCH_RATE_SIGN). */
+    dev->gyro_x_dps = MPU_PITCH_RATE_SIGN * dev->gx_dps;
+
+    /* This axis pairing assumes MPU6050 X is parallel to the wheel axle. */
+    dev->angle_acc_raw = atan2f(-dev->ay_g, dev->az_g) * MPU_RAD_TO_DEG;
+    dev->angle_acc = dev->angle_acc_raw;
+
+    accel_norm_sq = (dev->ax_g * dev->ax_g) +
+                    (dev->ay_g * dev->ay_g) +
+                    (dev->az_g * dev->az_g);
+
+    if (!dev->angle_initialized)
+    {
+        /* Seed the complementary filter from gravity, not an assumed zero angle. */
+        dev->angle = dev->angle_acc_raw;
+        dev->angle_initialized = true;
+    }
+    else
+    {
+        /* Integrate the pitch rate, not the raw chip rate.  Both must have
+           the same sign as angle_acc_raw or the filter fights itself. */
+        dev->angle += dev->gyro_x_dps * dt_s;
+
+        /* Correct gyro drift only when acceleration magnitude is close to 1 g. */
+        if ((accel_norm_sq >= MPU_ACCEL_NORM_MIN_SQ) &&
+            (accel_norm_sq <= MPU_ACCEL_NORM_MAX_SQ))
+        {
+            dev->angle += MPU_COMPLEMENTARY_ALPHA *
+                          (dev->angle_acc_raw - dev->angle);
+        }
+    }
+
+    dev->valid = true;
+    dev->last_hal_err = HAL_OK;
+    return true;
 }
 
-bool MPU6050_Reconnect(MPU6050_Data_t *d)
+void MPU6050_ResetAngle(MPU6050_Data_t *dev)
 {
-  MPU6050_BusRecover(d);
-  HAL_Delay(20);
-  if (!MPU6050_Init(s_i2c, d)) return false;
-  (void)MPU6050_Calibrate(d, MPU6050_CALIB_SAMPLES, HAL_Delay);
-  return true;
+    if (dev == NULL) return;
+    dev->angle = 0.0f;
+    dev->angle_acc_raw = 0.0f;
+    dev->angle_acc = 0.0f;
+    dev->angle_initialized = false;
 }

@@ -1,220 +1,273 @@
-/**
-  ******************************************************************************
-  * @file    balance_control.c
-  * @brief   Bo dieu khien can bang PD + vong toc do banh (xe tu can bang).
-  *
-  * Cau truc dung chuan xe tu can bang:
-  *   Vong ngoai: toc do banh -> target_angle thich ung (giup xe tu ham).
-  *   Vong trong: PD tren goc nghieng.
-  *
-  * Thu tu: doc imu -> tinh spd_f tu encoder -> dieu khien -> gioi han + motor.
-  ******************************************************************************
-  */
 #include "balance_control.h"
+#include <stddef.h>
+#include <math.h>
 
-/* Gia tri mac dinh cho xe nho, motor JGA25-370 12V.
- * Kp/Kd/Spd co the chinh qua debugger; gia tri nay la diem khoi dau on dinh. */
-#define BAL_DEFAULT_KP            35.0f
-#define BAL_DEFAULT_KD            8.0f
-#define BAL_DEFAULT_KI            0.0f
-#define BAL_DEFAULT_ANGLE_LIMIT   50.0f   /* deg: disarm neu |angle| > 50   */
-#define BAL_DEFAULT_RATE_LIMIT    800.0f  /* deg/s: bat thuong -> disarm    */
-#define BAL_DEFAULT_PWM_LIMIT     3000    /* gioi han PWM dau ra            */
-#define BAL_DEFAULT_INT_LIMIT     1000.0f
-#define BAL_DEFAULT_MAX_MISSED    5u
+#define BAL_DEFAULT_KP                120.0f
+#define BAL_DEFAULT_KD                 10.0f
+#define BAL_DEFAULT_KI                  0.0f
+#define BAL_DEFAULT_ANGLE_LIMIT        60.0f
+#define BAL_DEFAULT_RATE_LIMIT        700.0f
+#define BAL_DEFAULT_PWM_LIMIT        3000
+#define BAL_DEFAULT_INTEGRAL_LIMIT     100.0f
+#define BAL_DEFAULT_SPEED_KP             0.0f
+#define BAL_DEFAULT_SPEED_KI             0.0f
+#define BAL_DEFAULT_SPEED_MAX_DEG        5.0f
+#define BAL_DEFAULT_SPEED_ALPHA         0.25f
 
-/* Vong toc do: thong so an toan — chi dieu chinh goc muc tieu nho,
- * khong duoc de no chiem het dieu khien va lam xe dao dong.          */
-#define BAL_DEFAULT_SPD_KP        0.02f   /* do / (counts/s)               */
-#define BAL_DEFAULT_SPD_KI        0.0f    /* I toc do = 0 de on dinh       */
-#define BAL_DEFAULT_SPD_MAX_DEG   8.0f    /* goc lech toi da do toc do     */
+static float clampf_local(float value, float min_value, float max_value)
+{
+    if (value > max_value) return max_value;
+    if (value < min_value) return min_value;
+    return value;
+}
 
 void Balance_Init(Balance_t *b)
 {
-  b->kp = BAL_DEFAULT_KP;
-  b->kd = BAL_DEFAULT_KD;
-  b->ki = BAL_DEFAULT_KI;
-  b->integral       = 0.0f;
-  b->integral_limit = BAL_DEFAULT_INT_LIMIT;
+    if (b == NULL) return;
 
-  b->angle_sign = 1.0f;
-  b->gyro_sign  = 1.0f;
-  b->out_sign   = 1.0f;
+    b->kp = BAL_DEFAULT_KP;
+    b->kd = BAL_DEFAULT_KD;
+    b->ki = BAL_DEFAULT_KI;
+    b->integral = 0.0f;
+    b->integral_limit = BAL_DEFAULT_INTEGRAL_LIMIT;
 
-  b->target_angle    = 0.0f;
-  b->angle_limit_deg = BAL_DEFAULT_ANGLE_LIMIT;
-  b->rate_limit_dps  = BAL_DEFAULT_RATE_LIMIT;
-  b->pwm_limit       = BAL_DEFAULT_PWM_LIMIT;
-  b->deadband        = 0.0f;
+    /* These signs follow the convention documented in README.md. */
+    b->angle_sign = 1.0f;
+    b->gyro_sign = 1.0f;
+    b->output_sign = 1.0f;
 
-  b->control_out = 0.0f;
-  b->angle_now   = 0.0f;
-  b->rate_now    = 0.0f;
+    b->target_angle_deg = 0.0f;
+    b->angle_limit_deg = BAL_DEFAULT_ANGLE_LIMIT;
+    b->rate_limit_dps = BAL_DEFAULT_RATE_LIMIT;
+    b->pwm_limit = BAL_DEFAULT_PWM_LIMIT;
 
-  b->armed         = false;
-  b->status        = BAL_FAULT_NOT_ARMED;
-  b->run_cycles    = 0;
-  b->missed_cycles = 0;
-  b->max_missed    = BAL_DEFAULT_MAX_MISSED;
+    b->speed_loop_enabled = false;
+    b->speed_kp = BAL_DEFAULT_SPEED_KP;
+    b->speed_ki = BAL_DEFAULT_SPEED_KI;
+    b->speed_integral = 0.0f;
+    b->speed_integral_limit = 10000.0f;
+    b->speed_target_cps = 0.0f;
+    b->speed_filtered_cps = 0.0f;
+    b->speed_filter_alpha = BAL_DEFAULT_SPEED_ALPHA;
+    b->speed_angle_limit_deg = BAL_DEFAULT_SPEED_MAX_DEG;
 
-  /* Vong toc do — mac dinh BAT voi he so an toan nho */
-  b->spd_f       = 0.0f;
-  b->spd_int     = 0.0f;
-  b->spd_kp      = BAL_DEFAULT_SPD_KP;
-  b->spd_ki      = BAL_DEFAULT_SPD_KI;
-  b->spd_max_deg = BAL_DEFAULT_SPD_MAX_DEG;
-  b->spd_loop_en = true;    /* bat san voi he so an toan */
-
-  /* Danh gia can bang */
-  b->tune_ok       = 0;
-  b->tune_ok_cnt   = 0;
-  b->max_angle_abs = 0.0f;
-  b->max_rate_abs  = 0.0f;
-  b->max_spd_abs   = 0.0f;
-  b->ok_window     = 250u;
-}
-
-void Balance_SetWheelSpeed(Balance_t *b, float spd)
-{
-  /* Loc nhe de giam nhieu encoder: low-pass 0.7*cu + 0.3*moi */
-  b->spd_f = 0.7f * b->spd_f + 0.3f * spd;
-}
-
-void Balance_Arm(Balance_t *b)
-{
-  b->integral = 0.0f;
-  b->spd_int  = 0.0f;
-  b->status   = BAL_OK;
-  b->armed    = true;
-}
-
-void Balance_Disarm(Balance_t *b)
-{
-  b->armed    = false;
-  b->integral = 0.0f;
-  b->spd_int  = 0.0f;
-  if (b->status == BAL_OK) b->status = BAL_FAULT_NOT_ARMED;
+    b->angle_deg = 0.0f;
+    b->rate_dps = 0.0f;
+    b->angle_error_deg = 0.0f;
+    b->effective_target_deg = 0.0f;
+    b->p_term = 0.0f;
+    b->d_term = 0.0f;
+    b->i_term = 0.0f;
+    b->output_unclamped = 0.0f;
+    b->output_pwm = 0.0f;
+    b->update_count = 0U;
+    b->stable_count = 0U;
+    b->stable = 0U;
+    b->status = BAL_FAULT_NOT_ARMED;
+    b->armed = false;
 }
 
 void Balance_Reset(Balance_t *b)
 {
-  b->integral    = 0.0f;
-  b->spd_int     = 0.0f;
-  b->control_out = 0.0f;
+    if (b == NULL) return;
+
+    b->integral = 0.0f;
+    b->speed_integral = 0.0f;
+    b->speed_filtered_cps = 0.0f;
+    b->output_unclamped = 0.0f;
+    b->output_pwm = 0.0f;
+    b->stable_count = 0U;
+    b->stable = 0U;
 }
 
-Balance_Status_t Balance_Update(Balance_t *b, MPU6050_Data_t *imu, Motor_Handle_t *mot)
+void Balance_Arm(Balance_t *b)
 {
-  /* ---- Kiem tra an toan truoc ---- */
-  if (!imu->connected || !imu->calibrated || imu->err_count >= 3u) {
-    Balance_Disarm(b);
-    b->status = BAL_FAULT_IMU;
-    Motor_Disable(mot);
-    return b->status;
-  }
+    if (b == NULL) return;
 
-  float angle = imu->angle      * b->angle_sign;
-  float rate  = imu->gyro_x_dps * b->gyro_sign;
-  b->angle_now = angle;
-  b->rate_now  = rate;
-
-  if (angle > b->angle_limit_deg || angle < -b->angle_limit_deg) {
-    Balance_Disarm(b);
-    b->status = BAL_FAULT_ANGLE;
-    Motor_Disable(mot);
-    return b->status;
-  }
-  if (rate > b->rate_limit_dps || rate < -b->rate_limit_dps) {
-    Balance_Disarm(b);
-    b->status = BAL_FAULT_RATE;
-    Motor_Disable(mot);
-    return b->status;
-  }
-
-  /* ---- Vong ngoai: toc do banh -> target_angle thich ung ----
-   * Khi banh chay nhanh (xe troi), dieu chinh target_angle nguoc lai de
-   * than xe nghieng nguoc chieu chuyen dong -> tu ham, giu vi tri.
-   * Gioi han spd_max_deg de vong nay chi lam viec phu, khong dao dong. */
-  float target = b->target_angle;
-  if (b->spd_loop_en) {
-    b->spd_int += b->spd_f * 0.004f;
-    /* gioi han tich phan */
-    float int_lim = 1000.0f;
-    if (b->spd_int >  int_lim) b->spd_int =  int_lim;
-    if (b->spd_int < -int_lim) b->spd_int = -int_lim;
-
-    float spd_adj = b->spd_kp * b->spd_f + b->spd_ki * b->spd_int;
-    if (spd_adj >  b->spd_max_deg) spd_adj =  b->spd_max_deg;
-    if (spd_adj < -b->spd_max_deg) spd_adj = -b->spd_max_deg;
-
-    /* Khi banh chay theo chieu tien (xe troi), nghieng target nguoc lai
-     * de than xe nga ve phia truoc -> banh quay lai de ham.
-     * Dau can test: neu troi -> doi dau spd_kp. */
-    target -= spd_adj;
-  }
-
-  /* ---- Vong trong: PD goc ---- */
-  float error = target - angle;
-
-  b->integral += error * 0.004f;
-  if (b->integral >  b->integral_limit) b->integral =  b->integral_limit;
-  if (b->integral < -b->integral_limit) b->integral = -b->integral_limit;
-
-  float out = b->kp * error - b->kd * rate + b->ki * b->integral;
-  out *= b->out_sign;
-
-  /* Bu vung chet motor */
-  if (out >  0.5f) out += b->deadband;
-  else if (out < -0.5f) out -= b->deadband;
-
-  /* Gioi han dau ra */
-  int16_t effective_limit = b->pwm_limit;
-  if (effective_limit < 0) effective_limit = 0;
-  if (effective_limit > (int16_t)mot->pwm_max) effective_limit = (int16_t)mot->pwm_max;
-  if (out >  (float)effective_limit) out =  (float)effective_limit;
-  if (out < -(float)effective_limit) out = -(float)effective_limit;
-
-  b->control_out = out;
-  b->run_cycles++;
-
-  /* ---- Danh gia chat luong can bang ---- */
-  {
-    float aa = (angle < 0) ? -angle : angle;
-    float ra = (rate  < 0) ? -rate  : rate;
-    float sa = (b->spd_f < 0) ? -b->spd_f : b->spd_f;
-    if (aa > b->max_angle_abs) b->max_angle_abs = aa;
-    if (ra > b->max_rate_abs)  b->max_rate_abs  = ra;
-    if (sa > b->max_spd_abs)   b->max_spd_abs   = sa;
-
-    if (aa < 5.0f && ra < 30.0f && sa < 100.0f) {
-      if (b->tune_ok_cnt < 65000u) b->tune_ok_cnt++;
-    } else {
-      b->tune_ok_cnt = 0;
-      b->max_angle_abs = aa;
-      b->max_rate_abs  = ra;
-      b->max_spd_abs   = sa;
-    }
-    b->tune_ok = (b->tune_ok_cnt >= 100u) ? 1 : 0;
-  }
-
-  /* ---- Xuat motor ---- */
-  if (b->armed) {
+    Balance_Reset(b);
+    b->armed = true;
     b->status = BAL_OK;
-    int16_t cmd = (int16_t)(out >= 0 ? out + 0.5f : out - 0.5f);
-    Motor_SetBoth(mot, cmd, cmd);
-  } else {
-    Motor_Stop(mot);
-  }
-
-  return b->status;
 }
 
-void Balance_NotifyMissed(Balance_t *b, uint32_t missed, Motor_Handle_t *mot)
+void Balance_Disarm(Balance_t *b)
 {
-  b->missed_cycles += missed;
-  if (b->missed_cycles > b->max_missed) {
-    Balance_Disarm(b);
-    b->status = BAL_FAULT_TIMING;
-    Motor_Disable(mot);
-  }
+    if (b == NULL) return;
+
+    b->armed = false;
+    Balance_Reset(b);
+    if (b->status == BAL_OK)
+    {
+        b->status = BAL_FAULT_NOT_ARMED;
+    }
+}
+
+void Balance_SetWheelSpeed(Balance_t *b, float speed_cps)
+{
+    float alpha;
+
+    if (b == NULL || !isfinite(speed_cps)) return;
+
+    alpha = clampf_local(b->speed_filter_alpha, 0.0f, 1.0f);
+    b->speed_filtered_cps += alpha * (speed_cps - b->speed_filtered_cps);
+}
+
+static Balance_Status_t balance_fault(Balance_t *b,
+                                      Motor_Handle_t *motor,
+                                      Balance_Status_t reason)
+{
+    b->armed = false;
+    b->status = reason;
+    b->output_pwm = 0.0f;
+    b->output_unclamped = 0.0f;
+    b->integral = 0.0f;
+    b->speed_integral = 0.0f;
+    if (motor != NULL) Motor_Disable(motor);
+    return reason;
+}
+
+Balance_Status_t Balance_Update(Balance_t *b,
+                                const MPU6050_Data_t *imu,
+                                Motor_Handle_t *motor,
+                                float dt_s)
+{
+    float angle;
+    float rate;
+    float target;
+    float error;
+    float speed_adjust = 0.0f;
+    float output;
+    float p;
+    float d;
+    float i;
+    int32_t pwm_command;
+    int32_t pwm_limit;
+
+    if (b == NULL || imu == NULL || motor == NULL)
+    {
+        return BAL_FAULT_NUMERIC;
+    }
+
+    if (!b->armed)
+    {
+        b->status = BAL_FAULT_NOT_ARMED;
+        Motor_Stop(motor);
+        return b->status;
+    }
+
+    if (!imu->connected || !imu->valid || !imu->calibrated || (imu->err_count != 0U))
+    {
+        return balance_fault(b, motor, BAL_FAULT_IMU);
+    }
+
+    if (!isfinite(dt_s) || dt_s < 0.001f || dt_s > 0.020f)
+    {
+        return balance_fault(b, motor, BAL_FAULT_TIMING);
+    }
+
+    angle = imu->angle * b->angle_sign;
+    rate = imu->gyro_x_dps * b->gyro_sign;
+
+    if (!isfinite(angle) || !isfinite(rate))
+    {
+        return balance_fault(b, motor, BAL_FAULT_NUMERIC);
+    }
+
+    b->angle_deg = angle;
+    b->rate_dps = rate;
+
+    if (fabsf(angle) > b->angle_limit_deg)
+    {
+        return balance_fault(b, motor, BAL_FAULT_ANGLE);
+    }
+
+    if (fabsf(rate) > b->rate_limit_dps)
+    {
+        return balance_fault(b, motor, BAL_FAULT_RATE);
+    }
+
+    target = b->target_angle_deg;
+
+    /* Outer speed loop is optional and OFF by default.
+       Positive wheel speed means the robot is moving in the positive motor
+       direction.  To brake it, the body must lean the other way.  The angle
+       convention is flipped by output_sign, so the correction must be flipped
+       by the same amount.  (Speed loop assumes positive motor command = the
+       direction the encoders call positive.) */
+    if (b->speed_loop_enabled)
+    {
+        float speed_error = b->speed_filtered_cps - b->speed_target_cps;
+        b->speed_integral += speed_error * dt_s;
+        b->speed_integral = clampf_local(b->speed_integral,
+                                         -b->speed_integral_limit,
+                                          b->speed_integral_limit);
+        speed_adjust = b->speed_kp * speed_error + b->speed_ki * b->speed_integral;
+        speed_adjust = clampf_local(speed_adjust,
+                                    -b->speed_angle_limit_deg,
+                                     b->speed_angle_limit_deg);
+        target -= b->output_sign * speed_adjust;
+    }
+    else
+    {
+        b->speed_integral = 0.0f;
+    }
+
+    /* Convention: angle and rate share the same sign (guaranteed by the
+       MPU6050 driver).  Positive output drives the wheels toward the lean.
+       Therefore the P and D terms must have the same sign.  Ki is optional. */
+    error = angle - target;
+    b->angle_error_deg = error;
+    b->effective_target_deg = target;
+
+    p = b->kp * error;
+    d = b->kd * rate;
+
+    /* Integral is retained for later tuning; default Ki is exactly zero. */
+    if (b->ki != 0.0f)
+    {
+        b->integral += error * dt_s;
+        b->integral = clampf_local(b->integral,
+                                   -b->integral_limit,
+                                    b->integral_limit);
+    }
+    else
+    {
+        b->integral = 0.0f;
+    }
+    i = b->ki * b->integral;
+
+    output = b->output_sign * (p + d + i);
+    if (!isfinite(output))
+    {
+        return balance_fault(b, motor, BAL_FAULT_NUMERIC);
+    }
+
+    b->p_term = p;
+    b->d_term = d;
+    b->i_term = i;
+    b->output_unclamped = output;
+
+    pwm_limit = b->pwm_limit;
+    if (pwm_limit < 0) pwm_limit = 0;
+    if (pwm_limit > motor->pwm_max) pwm_limit = motor->pwm_max;
+
+    output = clampf_local(output, -(float)pwm_limit, (float)pwm_limit);
+    b->output_pwm = output;
+
+    pwm_command = (int32_t)((output >= 0.0f) ? (output + 0.5f) : (output - 0.5f));
+    Motor_SetBoth(motor, (int16_t)pwm_command, (int16_t)pwm_command);
+
+    b->update_count++;
+    if ((fabsf(angle - target) < 2.0f) && (fabsf(rate) < 12.0f) &&
+        (fabsf(b->speed_filtered_cps) < 80.0f))
+    {
+        if (b->stable_count < 1000U) b->stable_count++;
+    }
+    else
+    {
+        b->stable_count = 0U;
+    }
+    b->stable = (b->stable_count >= 100U) ? 1U : 0U;
+
+    b->status = BAL_OK;
+    return b->status;
 }

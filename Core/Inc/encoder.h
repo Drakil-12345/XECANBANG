@@ -1,80 +1,25 @@
-/**
-  ******************************************************************************
-  * @file    encoder.h
-  * @brief   Doc encoder quadrature qua TIM2 (phai) va TIM3 (trai).
-  *
-  *   Encoder TRAI : TIM3, CH1=PC6, CH2=PC7, 16-bit counter (Period=65535)
-  *   Encoder PHAI : TIM2, CH1=PA5, CH2=PA1, 32-bit counter (Period=0xFFFFFFFF)
-  *
-  * Day la cau hinh da dong bo voi so do phan cung trong XECANBANG.ioc.
-  * CubeMX se sinh MSP tuong ung: TIM3 dung GPIOC, TIM2 dung GPIOA.
-  * Neu thay doi day noi sau nay, phai cap nhat ca .ioc va MSP.
- *
-  * Dau encoder duoc chuan hoa qua Encoder_SetInvert() sao cho:
-  *   count > 0 khi banh quay theo chieu TIEN da chuan hoa.
-  ******************************************************************************
-  */
-#ifndef __ENCODER_H
-#define __ENCODER_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+#ifndef ENCODER_H
+#define ENCODER_H
 
 #include "main.h"
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
-typedef struct {
-  TIM_HandleTypeDef *htim;   /* TIM3 (trai) hoac TIM2 (phai) */
-  bool    is_32bit;          /* true = TIM2 (32-bit), false = TIM3 (16-bit) */
-  bool    invert;            /* dao dau dem */
-  int64_t count_total;       /* tong so xung tich luy (co dau) */
-  int32_t count_prev;        /* gia tri counter lan doc truoc (raw) */
-  int32_t delta;             /* so xung trong chu ky vua doc (co dau) */
-  float   speed_cps;         /* counts/second (neu da goi Update voi dt) */
+typedef struct
+{
+    TIM_HandleTypeDef *htim;
+    uint32_t previous_count;
+    bool invert;
+    bool started;
+    int32_t delta_counts;
+    int32_t count_total;   /* signed accumulated count, debug only */
+    float speed_raw_cps;
+    float speed_cps;
 } Encoder_Handle_t;
 
-/* ===================== API ===================== */
+/* invert=true when this timer counts negative while the chassis moves forward. */
+void Encoder_Init(Encoder_Handle_t *encoder, TIM_HandleTypeDef *htim, bool invert);
+void Encoder_Update(Encoder_Handle_t *encoder, float dt_s);
+void Encoder_Reset(Encoder_Handle_t *encoder);
 
-/**
- * @brief Khoi tao encoder: start TIM encoder mode, reset bien dem.
- * @param e       handle encoder
- * @param htim    TIM3 (trai) hoac TIM2 (phai)
- * @param is_32   true neu TIM2 (32-bit)
- */
-void Encoder_Init(Encoder_Handle_t *e, TIM_HandleTypeDef *htim, bool is_32);
-
-/**
- * @brief Doc counter hien tai, cap nhat delta & count_total.
- *        Goi dinh ky (trong chu ky dieu khien).
- * @param e   handle
- * @param dt  chu ky goi (giay) de tinh speed_cps; truyen 0 neu khong can toc do.
- */
-void Encoder_Update(Encoder_Handle_t *e, float dt);
-
-/**
- * @brief Lay so xung tich luy co dau (da chuan hoa dau).
- */
-int64_t Encoder_GetCount(const Encoder_Handle_t *e);
-
-/**
- * @brief Lay delta xung trong chu ky vua doc (co dau).
- */
-int32_t Encoder_GetDelta(const Encoder_Handle_t *e);
-
-/**
- * @brief Reset bo dem tich luy ve 0.
- */
-void Encoder_Reset(Encoder_Handle_t *e);
-
-/**
- * @brief Dao dau encoder (sau khi xac minh chieu quay thuc te).
- */
-void Encoder_SetInvert(Encoder_Handle_t *e, bool invert);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* __ENCODER_H */
+#endif /* ENCODER_H */
