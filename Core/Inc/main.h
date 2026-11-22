@@ -69,6 +69,8 @@ void Error_Handler(void);
 #define AIN1_GPIO_Port GPIOE
 #define AIN2_Pin GPIO_PIN_1
 #define AIN2_GPIO_Port GPIOE
+#define STATUS_LED_Pin GPIO_PIN_6
+#define STATUS_LED_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

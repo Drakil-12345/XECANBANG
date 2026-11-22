@@ -5,9 +5,9 @@
 #define BAL_DEFAULT_KP                120.0f
 #define BAL_DEFAULT_KD                 10.0f
 #define BAL_DEFAULT_KI                  0.0f
-#define BAL_DEFAULT_ANGLE_LIMIT        60.0f
+#define BAL_DEFAULT_ANGLE_LIMIT        50.0f
 #define BAL_DEFAULT_RATE_LIMIT        700.0f
-#define BAL_DEFAULT_PWM_LIMIT        3000
+#define BAL_DEFAULT_PWM_LIMIT        5500
 #define BAL_DEFAULT_INTEGRAL_LIMIT     100.0f
 #define BAL_DEFAULT_SPEED_KP             0.0f
 #define BAL_DEFAULT_SPEED_KI             0.0f
@@ -111,20 +111,6 @@ void Balance_SetWheelSpeed(Balance_t *b, float speed_cps)
     b->speed_filtered_cps += alpha * (speed_cps - b->speed_filtered_cps);
 }
 
-static Balance_Status_t balance_fault(Balance_t *b,
-                                      Motor_Handle_t *motor,
-                                      Balance_Status_t reason)
-{
-    b->armed = false;
-    b->status = reason;
-    b->output_pwm = 0.0f;
-    b->output_unclamped = 0.0f;
-    b->integral = 0.0f;
-    b->speed_integral = 0.0f;
-    if (motor != NULL) Motor_Disable(motor);
-    return reason;
-}
-
 Balance_Status_t Balance_Update(Balance_t *b,
                                 const MPU6050_Data_t *imu,
                                 Motor_Handle_t *motor,
@@ -154,14 +140,9 @@ Balance_Status_t Balance_Update(Balance_t *b,
         return b->status;
     }
 
-    if (!imu->connected || !imu->valid || !imu->calibrated || (imu->err_count != 0U))
+    if (!isfinite(dt_s) || dt_s <= 0.0f)
     {
-        return balance_fault(b, motor, BAL_FAULT_IMU);
-    }
-
-    if (!isfinite(dt_s) || dt_s < 0.001f || dt_s > 0.020f)
-    {
-        return balance_fault(b, motor, BAL_FAULT_TIMING);
+        return b->status;
     }
 
     angle = imu->angle * b->angle_sign;
@@ -169,30 +150,38 @@ Balance_Status_t Balance_Update(Balance_t *b,
 
     if (!isfinite(angle) || !isfinite(rate))
     {
-        return balance_fault(b, motor, BAL_FAULT_NUMERIC);
+        return b->status;
     }
 
     b->angle_deg = angle;
     b->rate_dps = rate;
 
+    /* Only safety cutoff kept: shut off motors when tilt exceeds angle_limit_deg (50 deg). */
     if (fabsf(angle) > b->angle_limit_deg)
     {
-        return balance_fault(b, motor, BAL_FAULT_ANGLE);
+        b->status = BAL_FAULT_ANGLE;
+        b->output_pwm = 0.0f;
+        b->output_unclamped = 0.0f;
+        b->integral = 0.0f;
+        b->speed_integral = 0.0f;
+        b->stable_count = 0U;
+        b->stable = 0U;
+        Motor_Disable(motor);
+        return BAL_FAULT_ANGLE;
     }
 
-    if (fabsf(rate) > b->rate_limit_dps)
+    if (!motor->enabled)
     {
-        return balance_fault(b, motor, BAL_FAULT_RATE);
+        Motor_Enable(motor);
     }
 
     target = b->target_angle_deg;
 
     /* Outer speed loop is optional and OFF by default.
-       Positive wheel speed means the robot is moving in the positive motor
-       direction.  To brake it, the body must lean the other way.  The angle
-       convention is flipped by output_sign, so the correction must be flipped
-       by the same amount.  (Speed loop assumes positive motor command = the
-       direction the encoders call positive.) */
+       Encoders are normalized so positive speed_filtered_cps means rolling
+       forward, and angle_sign defines which angle sign is a forward lean.
+       To brake forward motion, target angle must shift backward
+       (-angle_sign * speed_adjust), independent of motor wiring output_sign. */
     if (b->speed_loop_enabled)
     {
         float speed_error = b->speed_filtered_cps - b->speed_target_cps;
@@ -204,7 +193,7 @@ Balance_Status_t Balance_Update(Balance_t *b,
         speed_adjust = clampf_local(speed_adjust,
                                     -b->speed_angle_limit_deg,
                                      b->speed_angle_limit_deg);
-        target -= b->output_sign * speed_adjust;
+        target -= b->angle_sign * speed_adjust;
     }
     else
     {
@@ -238,7 +227,8 @@ Balance_Status_t Balance_Update(Balance_t *b,
     output = b->output_sign * (p + d + i);
     if (!isfinite(output))
     {
-        return balance_fault(b, motor, BAL_FAULT_NUMERIC);
+        Motor_Stop(motor);
+        return BAL_FAULT_NUMERIC;
     }
 
     b->p_term = p;

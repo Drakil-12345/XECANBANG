@@ -15,9 +15,9 @@
 
 #define MPU_I2C_TIMEOUT_MS       3U
 #define MPU_RAD_TO_DEG           57.29577951308232f
-#define MPU_COMPLEMENTARY_ALPHA  0.02f
-#define MPU_ACCEL_NORM_MIN_SQ    0.5625f
-#define MPU_ACCEL_NORM_MAX_SQ    1.5625f
+#define MPU_COMPLEMENTARY_ALPHA  0.005f    /* tau ~= 0.80 s at 250 Hz: rejects linear accel */
+#define MPU_ACCEL_NORM_MIN_SQ    0.5625f   /* (0.75 g)^2: allows clone accel Z offset */
+#define MPU_ACCEL_NORM_MAX_SQ    1.5625f   /* (1.25 g)^2 */
 #define MPU_MAX_CONSEC_ERRORS    3U
 
 /*
@@ -117,10 +117,12 @@ bool MPU6050_Calibrate(MPU6050_Data_t *dev,
         if (delay_ms != NULL) delay_ms(5U);
     }
 
-    if (valid_samples < (uint16_t)((count * 9U) / 10U))
+    if (valid_samples == 0U)
     {
-        dev->calibrated = false;
+        dev->gyro_x_bias = 0.0f;
+        dev->calibrated = true;
         dev->valid = false;
+        dev->angle_initialized = false;
         return false;
     }
 
@@ -129,15 +131,15 @@ bool MPU6050_Calibrate(MPU6050_Data_t *dev,
         float variance = (sum_sq / (float)valid_samples) - (mean * mean);
         float std_dev = sqrtf((variance > 0.0f) ? variance : 0.0f);
 
-        /* Calibration must be done while the robot is motionless. */
-        if ((std_dev >= 1.5f) || (fabsf(mean) >= 20.0f))
+        /* Use measured bias if reasonably still; otherwise fall back to 0 so power-on never blocks. */
+        if ((std_dev < 5.0f) && (fabsf(mean) < 20.0f))
         {
-            dev->calibrated = false;
-            dev->valid = false;
-            return false;
+            dev->gyro_x_bias = mean;
         }
-
-        dev->gyro_x_bias = mean;
+        else
+        {
+            dev->gyro_x_bias = 0.0f;
+        }
     }
 
     dev->calibrated = true;

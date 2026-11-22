@@ -71,13 +71,12 @@ static void apply_one(Motor_Handle_t *m,
     direction = (electrical > 0) ? 1 : -1;
     magnitude = (electrical > 0) ? electrical : -electrical;
 
-    /* Minimum PWM is a floor to overcome gearbox friction, NOT a replacement
-       for the controller output.  The old code forced every non-zero command
-       to exactly min_pwm, which turned the PD controller into bang-bang and
-       made balancing impossible. */
-    if ((min_pwm > 0U) && (magnitude < (int32_t)min_pwm))
+    /* Linear deadband compensation: add min_pwm on top of magnitude so the
+       controller keeps proportional slope right above gearbox static friction
+       instead of flattening 1..min_pwm into a bang-bang shelf. */
+    if (min_pwm > 0U)
     {
-        magnitude = (int32_t)min_pwm;
+        magnitude += (int32_t)min_pwm;
     }
 
     if (magnitude > (int32_t)m->pwm_max) magnitude = m->pwm_max;

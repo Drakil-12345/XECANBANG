@@ -24,11 +24,11 @@ TIM_HandleTypeDef htim9;
 /* ---------------------- Control timing -------------------------- */
 #define CONTROL_DT_S             0.004f
 #define CONTROL_RATE_HZ          250U
-#define ARM_MAX_ANGLE_DEG        8.0f
-#define ARM_MAX_RATE_DPS         25.0f
-#define AUTO_ARM_HOLD_TICKS      250U  /* 1 second at 250 Hz */
-#define IMU_STARTUP_ATTEMPTS     5U
-#define IMU_WARMUP_SAMPLES       100U
+#define IMU_STARTUP_ATTEMPTS     10U
+#define IMU_STARTUP_CALIB_SAMPLES 100U
+#define IMU_WARMUP_SAMPLES       50U
+#define IMU_RECONNECT_TICKS      50U   /* retry every 200 ms at 250 Hz */
+#define STATUS_LED_BLINK_TICKS   25U   /* toggle every 100 ms at 250 Hz (5 Hz) */
 
 /* ---------------------- Application objects --------------------- */
 MPU6050_Data_t g_imu;
@@ -48,24 +48,24 @@ volatile System_State_t g_state = SYS_IDLE;
 volatile Balance_Status_t g_fault_code = BAL_FAULT_NOT_ARMED;
 
 /* ---------------------- Live Expressions controls ----------------
- * Set values directly in Keil. There are no hidden "0 means default" rules.
- * Do not enable auto-arm until the feedback sign has been verified.
+ * Robot starts armed automatically on power-on.
+ * Only safety cutoff: motors disable when |angle| > g_angle_limit_deg (50 deg).
  */
-volatile uint8_t  g_arm_request = 1U;          /* write 1 for one-shot ARM */
+volatile uint8_t  g_arm_request = 0U;          /* write 1 to re-ARM after manual disarm */
 volatile uint8_t  g_disarm_request = 0U;       /* write 1 to DISARM */
-volatile uint8_t  g_clear_fault_request = 0U;  /* write 1 after fault is fixed */
+volatile uint8_t  g_clear_fault_request = 0U;  /* kept for Live Expressions compatibility */
 volatile uint8_t  g_calib_request = 0U;        /* write 1 while robot is still */
 volatile uint8_t  g_capture_target_request = 0U; /* write 1 at the balance point */
-volatile uint8_t  g_auto_arm_enable = 0U;      /* disabled by default */
+volatile uint8_t  g_auto_arm_enable = 1U;      /* auto-run on power-on enabled */
 
 /* Starting gains for a small JGA25-370/TB6612 robot.
  * Tune with the wheels raised first, then on the ground:
  *   Kp too low -> falls; too high -> fast oscillation.
  *   Kd too low -> keeps oscillating; too high -> buzzing / jitter. */
-volatile float    g_kp = 900.0f;
-volatile float    g_kd = 25.0f;
-volatile float    g_ki = 200.0f;
-volatile float    g_target_angle_deg = 0.0f;
+volatile float    g_kp = 800.0f;
+volatile float    g_kd = 15.0f;
+volatile float    g_ki = 0.0f;
+volatile float    g_target_angle_deg = -0.3f;
 
 /* g_angle_sign only flips the telemetry/control convention.  The gyro sign
  * is tied to it automatically (rate must be d(angle)/dt).  To fix a robot
@@ -77,12 +77,12 @@ volatile float    g_target_angle_deg = 0.0f;
  * MPU differently, repeat README step 4 and set +1/-1 accordingly. */
 volatile float    g_angle_sign = 1.0f;
 volatile float    g_output_sign = -1.0f;
-volatile int32_t  g_pwm_limit = 3000;
-volatile float    g_angle_limit_deg = 45.0f;
+volatile int32_t  g_pwm_limit = 5500;
+volatile float    g_angle_limit_deg = 50.0f;
 volatile float    g_rate_limit_dps = 700.0f;
 
 /* Outer speed loop: OFF by default until the angle loop is stable. */
-volatile uint8_t  g_speed_loop_enable = 0U;
+volatile uint8_t  g_speed_loop_enable = 1U;
 volatile float    g_speed_kp = 0.003f;   /* deg / (encoder count/s) */
 volatile float    g_speed_ki = 0.0f;
 volatile float    g_speed_target_cps = 0.0f;
@@ -130,9 +130,9 @@ static void MX_TIM9_Init(void);
 static int16_t clamp_to_i16(int32_t value);
 static uint16_t clamp_to_u16(int32_t value, uint16_t maximum);
 static void apply_debug_configuration(void);
+static void status_led_set(bool on);
+static void update_status_led(bool error_active);
 static void enter_idle(void);
-static void enter_fault(Balance_Status_t reason);
-static bool imu_is_arm_safe(void);
 static bool try_arm(void);
 static void process_motor_test(void);
 static void warmup_imu_filter(void);
@@ -191,6 +191,41 @@ static void apply_debug_configuration(void)
     g_enc_right.invert = (g_encoder_right_invert != 0U);
 }
 
+static void status_led_set(bool on)
+{
+    /* Active-LOW on STM32F407VET6 Black Board (PA6 / LED D2). */
+    HAL_GPIO_WritePin(STATUS_LED_GPIO_Port, STATUS_LED_Pin,
+                      on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
+
+static void update_status_led(bool error_active)
+{
+    static uint16_t blink_div = 0U;
+    static bool blink_on = false;
+
+    if (error_active)
+    {
+        if (++blink_div >= STATUS_LED_BLINK_TICKS)
+        {
+            blink_div = 0U;
+            blink_on = !blink_on;
+        }
+        status_led_set(blink_on);
+    }
+    else if (g_state == SYS_RUN)
+    {
+        blink_div = 0U;
+        blink_on = false;
+        status_led_set(true);
+    }
+    else
+    {
+        blink_div = 0U;
+        blink_on = false;
+        status_led_set(false);
+    }
+}
+
 static void enter_idle(void)
 {
     Balance_Disarm(&g_balance);
@@ -200,41 +235,9 @@ static void enter_idle(void)
     g_auto_arm_count = 0U;
 }
 
-static void enter_fault(Balance_Status_t reason)
-{
-    Balance_Disarm(&g_balance);
-    g_balance.status = reason;
-    Motor_Disable(&g_motor);
-    g_state = SYS_RUN;
-    g_fault_code = reason;
-    g_auto_arm_count = 0U;
-}
-
-static bool imu_is_arm_safe(void)
-{
-    float angle_error;
-
-    if (!g_imu.connected || !g_imu.valid || !g_imu.calibrated ||
-        (g_imu.err_count != 0U))
-    {
-        return false;
-    }
-
-    angle_error = (g_imu.angle * g_balance.angle_sign) - g_target_angle_deg;
-    if (fabsf(angle_error) > ARM_MAX_ANGLE_DEG) return false;
-    if (fabsf(g_imu.gyro_x_dps * g_balance.gyro_sign) > ARM_MAX_RATE_DPS) return false;
-    return true;
-}
-
 static bool try_arm(void)
 {
-    if (g_state != SYS_IDLE) return false;
-    if (g_motor_test != 0) return false;   /* stop the motor test before ARM */
-    if (!imu_is_arm_safe()) return false;
-
     apply_debug_configuration();
-    /* apply_debug_configuration already clamped min PWM to motor.pwm_max. */
-    Motor_Enable(&g_motor);
     Balance_Arm(&g_balance);
     g_state = SYS_RUN;
     g_fault_code = BAL_OK;
@@ -247,9 +250,8 @@ static void process_motor_test(void)
     static bool test_active = false;
     int16_t command;
 
-    if (((g_state == SYS_IDLE) || (g_state == SYS_FAULT)) &&
-        (g_motor_test_enable != 0U) && (g_motor_test != 0) &&
-        (g_auto_arm_enable == 0U))
+    if ((g_state == SYS_IDLE) &&
+        (g_motor_test_enable != 0U) && (g_motor_test != 0))
     {
         if (!test_active)
         {
@@ -287,10 +289,7 @@ static bool recalibrate_imu(void)
     if (g_balance.armed) return false;
 
     Motor_Disable(&g_motor);
-    if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
-    {
-        Error_Handler();
-    }
+    (void)HAL_TIM_Base_Stop_IT(&htim6);
 
     ok = MPU6050_Calibrate(&g_imu, MPU6050_CALIB_SAMPLES, HAL_Delay);
     if (ok)
@@ -310,6 +309,7 @@ static bool recalibrate_imu(void)
 
 static void run_one_control_tick(void)
 {
+    static uint16_t imu_retry_div = 0U;
     float average_speed;
     Balance_Status_t status;
 
@@ -318,24 +318,37 @@ static void run_one_control_tick(void)
 
     apply_debug_configuration();
 
-    /* Motor test độc lập với IMU và PID */
+    /* Motor test works when manually disarmed (SYS_IDLE). */
     process_motor_test();
 
-    /* Read IMU */
+    /* Auto-reconnect IMU if it was not ready at power-on or dropped out. */
+    if (!g_imu.connected)
+    {
+        g_imu_read_ok = 0U;
+        if (g_state == SYS_RUN)
+        {
+            Motor_Disable(&g_motor);
+        }
+
+        if (++imu_retry_div >= IMU_RECONNECT_TICKS)
+        {
+            imu_retry_div = 0U;
+            if (MPU6050_Init(&hi2c2, &g_imu))
+            {
+                g_imu.calibrated = true;
+            }
+        }
+        update_status_led(true);
+        return;
+    }
+    imu_retry_div = 0U;
+
+    /* Read IMU: never latch a fault on transient I2C glitches. */
     if (!MPU6050_Update(&g_imu, CONTROL_DT_S))
     {
         g_imu_read_ok = 0U;
         g_imu_fail_count++;
-
-        if (g_state == SYS_RUN)
-        {
-            enter_fault(BAL_FAULT_IMU);
-        }
-        else if (g_imu.err_count >= 3U)
-        {
-            g_fault_code = BAL_FAULT_IMU;
-        }
-
+        update_status_led(true);
         return;
     }
 
@@ -350,30 +363,19 @@ static void run_one_control_tick(void)
     g_encoder_average_cps = average_speed;
     Balance_SetWheelSpeed(&g_balance, average_speed);
 
-    /* 3) Handle operator requests. */
+    /* 3) Handle optional debugger requests. */
     if (g_disarm_request != 0U)
     {
         g_disarm_request = 0U;
-        if (g_state == SYS_FAULT)
-        {
-            Motor_Disable(&g_motor);
-        }
-        else
-        {
-            enter_idle();
-        }
+        enter_idle();
+        update_status_led(false);
         return;
     }
 
     if (g_clear_fault_request != 0U)
     {
         g_clear_fault_request = 0U;
-        if (g_state == SYS_FAULT && g_imu.valid && g_imu.connected && g_imu.calibrated)
-        {
-            Balance_Reset(&g_balance);
-            g_state = SYS_IDLE;
-            g_fault_code = BAL_FAULT_NOT_ARMED;
-        }
+        Balance_Reset(&g_balance);
     }
 
     if (g_calib_request != 0U)
@@ -381,16 +383,7 @@ static void run_one_control_tick(void)
         g_calib_request = 0U;
         if (!g_balance.armed)
         {
-            if (!recalibrate_imu())
-            {
-                enter_fault(BAL_FAULT_IMU);
-                return;
-            }
-            if (g_state == SYS_FAULT)
-            {
-                g_state = SYS_IDLE;
-                g_fault_code = BAL_FAULT_NOT_ARMED;
-            }
+            (void)recalibrate_imu();
         }
     }
 
@@ -400,11 +393,8 @@ static void run_one_control_tick(void)
     if (g_capture_target_request != 0U)
     {
         g_capture_target_request = 0U;
-        if (!g_balance.armed)
-        {
-            g_target_angle_deg = g_imu.angle * g_balance.angle_sign;
-            g_balance.target_angle_deg = g_target_angle_deg;
-        }
+        g_target_angle_deg = g_imu.angle * g_balance.angle_sign;
+        g_balance.target_angle_deg = g_target_angle_deg;
     }
 
     if (g_arm_request != 0U)
@@ -413,40 +403,23 @@ static void run_one_control_tick(void)
         (void)try_arm();
     }
 
-    if ((g_auto_arm_enable != 0U) && (g_state == SYS_IDLE))
-    {
-        if (imu_is_arm_safe())
-        {
-            if (g_auto_arm_count < AUTO_ARM_HOLD_TICKS) g_auto_arm_count++;
-            if (g_auto_arm_count >= AUTO_ARM_HOLD_TICKS) (void)try_arm();
-        }
-        else
-        {
-            g_auto_arm_count = 0U;
-        }
-    }
-    else if (g_auto_arm_enable == 0U)
-    {
-        g_auto_arm_count = 0U;
-    }
-
-    /* 5) Inner balance controller. */
+    /* 4) Inner balance controller.
+       Only safety cutoff: |angle| > 50 deg disables motors and resets integrals;
+       when stood back upright (|angle| <= 50 deg), motors re-enable automatically. */
     if ((g_state == SYS_RUN) && g_balance.armed)
     {
         status = Balance_Update(&g_balance, &g_imu, &g_motor, CONTROL_DT_S);
-        if (status != BAL_OK)
-        {
-            enter_fault(status);
-        }
+        g_fault_code = status;
     }
+
+    update_status_led((g_state == SYS_RUN) && (g_fault_code != BAL_OK));
 }
 
 /* ---------------------- Main -------------------------------------- */
 int main(void)
 {
-	g_reset_flags = RCC->CSR;
-
-	    __HAL_RCC_CLEAR_RESET_FLAGS();
+    g_reset_flags = RCC->CSR;
+    __HAL_RCC_CLEAR_RESET_FLAGS();
 
     bool imu_ok = false;
 
@@ -460,11 +433,11 @@ int main(void)
     MX_TIM6_Init();
     MX_TIM9_Init();
 
-    /* Ensure TB6612 is disabled before touching any module. */
+    /* Ensure TB6612 is disabled during startup. */
     HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
     Motor_Init(&g_motor, &htim9);
-    Motor_SetPwmLimit(&g_motor, 3000U);
+    Motor_SetPwmLimit(&g_motor, 6500U);
     Motor_SetInvert(&g_motor, false, true); /* preserve project wiring */
     Motor_SetTrim(&g_motor, 0, 0);
     Motor_SetMinPwm(&g_motor, 0U, 0U);
@@ -478,31 +451,23 @@ int main(void)
     Balance_Init(&g_balance);
     apply_debug_configuration();
 
+    /* Brief delay so battery/3.3V power rail stabilizes on power-on. */
+    HAL_Delay(100U);
+
     for (uint8_t attempt = 0U; (attempt < IMU_STARTUP_ATTEMPTS) && !imu_ok; attempt++)
     {
         imu_ok = MPU6050_Init(&hi2c2, &g_imu);
-        if (!imu_ok) HAL_Delay(100U);
+        if (!imu_ok) HAL_Delay(50U);
     }
 
     if (imu_ok)
     {
-        imu_ok = MPU6050_Calibrate(&g_imu, MPU6050_CALIB_SAMPLES, HAL_Delay);
-    }
-
-    if (imu_ok)
-    {
+        (void)MPU6050_Calibrate(&g_imu, IMU_STARTUP_CALIB_SAMPLES, HAL_Delay);
         warmup_imu_filter();
-        imu_ok = g_imu.valid;
     }
 
-    if (!imu_ok)
-    {
-        enter_fault(BAL_FAULT_IMU);
-    }
-    else
-    {
-        enter_idle();
-    }
+    /* Auto-start immediately on power-on (only cutoff is |angle| > 50 deg). */
+    (void)try_arm();
 
     /* TIM6 clock = 84 MHz (APB1 timer clock), PSC=83 -> 1 MHz,
        ARR=3999 -> exactly 250 Hz. */
@@ -519,18 +484,12 @@ int main(void)
 
         if (pending == 0U)
         {
-        	//__WFI();
             continue;
         }
 
         if (pending > 1U)
         {
             g_tick_overrun_count += (uint32_t)(pending - 1U);
-            if (g_state == SYS_RUN)
-            {
-                enter_fault(BAL_FAULT_TIMING);
-                continue;
-            }
         }
 
         /* Do not replay old ticks: one fresh sensor sample per control update. */
@@ -694,6 +653,7 @@ static void MX_GPIO_Init(void)
 
     HAL_GPIO_WritePin(GPIOE, BIN1_Pin | AIN1_Pin | AIN2_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, BIN2_Pin | STBY_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(STATUS_LED_GPIO_Port, STATUS_LED_Pin, GPIO_PIN_SET);
 
     gpio.Pin = BIN1_Pin | AIN1_Pin | AIN2_Pin;
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
@@ -706,6 +666,12 @@ static void MX_GPIO_Init(void)
     gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &gpio);
+
+    gpio.Pin = STATUS_LED_Pin;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(STATUS_LED_GPIO_Port, &gpio);
 }
 
 /* ---------------------- Interrupt callbacks ----------------------- */
@@ -723,7 +689,11 @@ void Error_Handler(void)
     TIM9->CCR1 = 0U;
     TIM9->CCR2 = 0U;
     GPIOC->BSRR = (uint32_t)STBY_Pin << 16U;
-    while (1) { }
+    while (1)
+    {
+        STATUS_LED_GPIO_Port->ODR ^= STATUS_LED_Pin;
+        for (volatile uint32_t i = 0U; i < 2000000U; i++) { }
+    }
 }
 
 #ifdef USE_FULL_ASSERT
