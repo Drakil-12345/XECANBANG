@@ -63,9 +63,9 @@ volatile uint8_t  g_auto_arm_enable = 1U;      /* auto-run on power-on enabled *
  *   Kp too low -> falls; too high -> fast oscillation.
  *   Kd too low -> keeps oscillating; too high -> buzzing / jitter. */
 volatile float    g_kp = 800.0f;
-volatile float    g_kd = 15.0f;
+volatile float    g_kd = 21.0f;
 volatile float    g_ki = 0.0f;
-volatile float    g_target_angle_deg = -0.3f;
+volatile float    g_target_angle_deg = 0.0f;
 
 /* g_angle_sign only flips the telemetry/control convention.  The gyro sign
  * is tied to it automatically (rate must be d(angle)/dt).  To fix a robot
@@ -77,16 +77,22 @@ volatile float    g_target_angle_deg = -0.3f;
  * MPU differently, repeat README step 4 and set +1/-1 accordingly. */
 volatile float    g_angle_sign = 1.0f;
 volatile float    g_output_sign = -1.0f;
-volatile int32_t  g_pwm_limit = 5500;
+volatile int32_t  g_pwm_limit = 7500;
 volatile float    g_angle_limit_deg = 50.0f;
 volatile float    g_rate_limit_dps = 700.0f;
 
-/* Outer speed loop: OFF by default until the angle loop is stable. */
+/* Outer speed loop: fast P damping + separate slow dynamic auto-trim. */
 volatile uint8_t  g_speed_loop_enable = 1U;
-volatile float    g_speed_kp = 0.003f;   /* deg / (encoder count/s) */
-volatile float    g_speed_ki = 0.0f;
+volatile float    g_speed_kp = 0.005f;   /* deg / (encoder count/s) */
+volatile float    g_speed_ki = 0.0f;     /* kept 0: dynamic auto-trim handles offset learning */
 volatile float    g_speed_target_cps = 0.0f;
-volatile float    g_speed_angle_limit_deg = 5.0f;
+volatile float    g_speed_angle_limit_deg = 8.0f;
+
+/* Dynamic balance-point auto-trim (self-adjusts target angle online). */
+volatile uint8_t  g_auto_trim_enable = 1U;
+volatile float    g_auto_trim_ki = 0.0018f;      /* deg / (count/s * s) */
+volatile float    g_auto_trim_limit_deg = 15.0f; /* max learned offset (+/- deg) */
+volatile float    g_dynamic_trim_deg = 0.0f;     /* debug: current learned offset */
 
 /* Encoder direction normalisation (both positive when the robot rolls forward). */
 volatile uint8_t  g_encoder_left_invert = 1U;
@@ -182,6 +188,10 @@ static void apply_debug_configuration(void)
     g_balance.speed_target_cps = g_speed_target_cps;
     g_balance.speed_angle_limit_deg = fabsf(g_speed_angle_limit_deg);
 
+    g_balance.auto_trim_enabled = (g_auto_trim_enable != 0U);
+    g_balance.auto_trim_ki = g_auto_trim_ki;
+    g_balance.auto_trim_limit_deg = fabsf(g_auto_trim_limit_deg);
+
     Motor_SetTrim(&g_motor, clamp_to_i16(g_trim_left), clamp_to_i16(g_trim_right));
     Motor_SetMinPwm(&g_motor,
                     clamp_to_u16(g_min_pwm_left, g_motor.pwm_max),
@@ -275,10 +285,21 @@ static void process_motor_test(void)
 
 static void warmup_imu_filter(void)
 {
+    float acc_sum = 0.0f;
+    uint16_t acc_count = 0U;
+
     for (uint16_t i = 0U; i < IMU_WARMUP_SAMPLES; i++)
     {
         if (!MPU6050_Update(&g_imu, CONTROL_DT_S)) break;
+        acc_sum += g_imu.angle_acc_raw;
+        acc_count++;
         HAL_Delay(4U);
+    }
+
+    if (acc_count > 0U)
+    {
+        g_imu.angle = acc_sum / (float)acc_count;
+        g_imu.angle_initialized = true;
     }
 }
 
@@ -376,6 +397,8 @@ static void run_one_control_tick(void)
     {
         g_clear_fault_request = 0U;
         Balance_Reset(&g_balance);
+        g_balance.dynamic_trim_deg = 0.0f;
+        g_dynamic_trim_deg = 0.0f;
     }
 
     if (g_calib_request != 0U)
@@ -395,6 +418,8 @@ static void run_one_control_tick(void)
         g_capture_target_request = 0U;
         g_target_angle_deg = g_imu.angle * g_balance.angle_sign;
         g_balance.target_angle_deg = g_target_angle_deg;
+        g_balance.dynamic_trim_deg = 0.0f;
+        g_dynamic_trim_deg = 0.0f;
     }
 
     if (g_arm_request != 0U)
@@ -410,6 +435,7 @@ static void run_one_control_tick(void)
     {
         status = Balance_Update(&g_balance, &g_imu, &g_motor, CONTROL_DT_S);
         g_fault_code = status;
+        g_dynamic_trim_deg = g_balance.dynamic_trim_deg;
     }
 
     update_status_led((g_state == SYS_RUN) && (g_fault_code != BAL_OK));
@@ -437,7 +463,7 @@ int main(void)
     HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
     Motor_Init(&g_motor, &htim9);
-    Motor_SetPwmLimit(&g_motor, 6500U);
+    Motor_SetPwmLimit(&g_motor, MOTOR_PWM_ABS_MAX);
     Motor_SetInvert(&g_motor, false, true); /* preserve project wiring */
     Motor_SetTrim(&g_motor, 0, 0);
     Motor_SetMinPwm(&g_motor, 0U, 0U);

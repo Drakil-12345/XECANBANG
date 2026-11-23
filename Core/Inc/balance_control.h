@@ -37,7 +37,7 @@ typedef struct
     float rate_limit_dps;      /* safety cutoff */
     int16_t pwm_limit;         /* controller output limit */
 
-    /* Optional outer wheel-speed loop. Disabled by default. */
+    /* Optional outer wheel-speed loop. */
     bool speed_loop_enabled;
     float speed_kp;            /* degree / (encoder count/second) */
     float speed_ki;
@@ -47,6 +47,15 @@ typedef struct
     float speed_filtered_cps;
     float speed_filter_alpha;  /* 0..1, higher = less filtering */
     float speed_angle_limit_deg;
+
+    /* Dynamic auto-trim: slowly learns true COM / floor balance angle online. */
+    bool auto_trim_enabled;
+    float auto_trim_ki;          /* degree / (count/s * second) */
+    float auto_trim_limit_deg;   /* max learned offset (+/- deg) */
+    float auto_trim_max_rate_dps;/* max adaptation speed (deg/s) */
+    float auto_trim_deadband_cps;/* ignore tiny speed below this */
+    float speed_slow_cps;        /* heavily filtered speed (~0.5 s tau) */
+    float dynamic_trim_deg;      /* learned offset added to target_angle_deg */
 
     /* Debug values: visible in Keil Live Expressions. */
     float angle_deg;

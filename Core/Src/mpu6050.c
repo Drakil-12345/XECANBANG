@@ -64,12 +64,9 @@ bool MPU6050_Init(I2C_HandleTypeDef *hi2c, MPU6050_Data_t *dev)
     dev->whoami_ok = (who == MPU_WHO_AM_I_VALUE);
     if (!dev->whoami_ok) return false;
 
-    /* Wake up, gyro +/-500 dps, accel +/-2 g, DLPF ~44 Hz.
-     * Internal sample rate 1 kHz; the control loop reads it at 250 Hz, so
-     * the freshest sample is only ~1 ms old (SMPLRT_DIV=3 would add up to
-     * 4 ms of latency because the sensor would update at exactly the read
-     * rate). */
-    if (!write_register(MPU_REG_PWR_MGMT_1, 0x00U) ||
+    /* Wake up using PLL with X-axis gyro reference (recommended by datasheet),
+     * gyro +/-500 dps, accel +/-2 g, DLPF ~44 Hz, internal sample rate 1 kHz. */
+    if (!write_register(MPU_REG_PWR_MGMT_1, 0x01U) ||
         !write_register(MPU_REG_GYRO_CONFIG, 0x08U) ||
         !write_register(MPU_REG_ACCEL_CONFIG, 0x00U) ||
         !write_register(MPU_REG_CONFIG, 0x03U) ||
@@ -101,6 +98,9 @@ bool MPU6050_Calibrate(MPU6050_Data_t *dev,
 
     count = (samples > 0U) ? samples : MPU6050_CALIB_SAMPLES;
 
+    /* Wait for MEMS gyroscope resonator to settle after cold wake-up. */
+    if (delay_ms != NULL) delay_ms(100U);
+
     for (uint16_t i = 0U; i < count; i++)
     {
         if (HAL_I2C_Mem_Read(s_hi2c, MPU6050_I2C_ADDR8, MPU_REG_GYRO_XOUT_H,
@@ -131,8 +131,8 @@ bool MPU6050_Calibrate(MPU6050_Data_t *dev,
         float variance = (sum_sq / (float)valid_samples) - (mean * mean);
         float std_dev = sqrtf((variance > 0.0f) ? variance : 0.0f);
 
-        /* Use measured bias if reasonably still; otherwise fall back to 0 so power-on never blocks. */
-        if ((std_dev < 5.0f) && (fabsf(mean) < 20.0f))
+        /* Accept gyro bias when held steadily or resting motionless. */
+        if ((std_dev < 3.0f) && (fabsf(mean) < 15.0f))
         {
             dev->gyro_x_bias = mean;
         }

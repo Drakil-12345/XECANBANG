@@ -7,12 +7,17 @@
 #define BAL_DEFAULT_KI                  0.0f
 #define BAL_DEFAULT_ANGLE_LIMIT        50.0f
 #define BAL_DEFAULT_RATE_LIMIT        700.0f
-#define BAL_DEFAULT_PWM_LIMIT        5500
+#define BAL_DEFAULT_PWM_LIMIT        7500
 #define BAL_DEFAULT_INTEGRAL_LIMIT     100.0f
 #define BAL_DEFAULT_SPEED_KP             0.0f
 #define BAL_DEFAULT_SPEED_KI             0.0f
-#define BAL_DEFAULT_SPEED_MAX_DEG        5.0f
+#define BAL_DEFAULT_SPEED_MAX_DEG        8.0f
 #define BAL_DEFAULT_SPEED_ALPHA         0.25f
+#define BAL_DEFAULT_AUTO_TRIM_KI        0.0018f
+#define BAL_DEFAULT_AUTO_TRIM_LIMIT    15.0f
+#define BAL_DEFAULT_AUTO_TRIM_RATE      3.0f
+#define BAL_DEFAULT_AUTO_TRIM_DEADBAND 30.0f
+#define BAL_SPEED_SLOW_ALPHA            0.010f  /* tau ~= 0.40 s at 250 Hz */
 
 static float clampf_local(float value, float min_value, float max_value)
 {
@@ -51,6 +56,14 @@ void Balance_Init(Balance_t *b)
     b->speed_filter_alpha = BAL_DEFAULT_SPEED_ALPHA;
     b->speed_angle_limit_deg = BAL_DEFAULT_SPEED_MAX_DEG;
 
+    b->auto_trim_enabled = true;
+    b->auto_trim_ki = BAL_DEFAULT_AUTO_TRIM_KI;
+    b->auto_trim_limit_deg = BAL_DEFAULT_AUTO_TRIM_LIMIT;
+    b->auto_trim_max_rate_dps = BAL_DEFAULT_AUTO_TRIM_RATE;
+    b->auto_trim_deadband_cps = BAL_DEFAULT_AUTO_TRIM_DEADBAND;
+    b->speed_slow_cps = 0.0f;
+    b->dynamic_trim_deg = 0.0f;
+
     b->angle_deg = 0.0f;
     b->rate_dps = 0.0f;
     b->angle_error_deg = 0.0f;
@@ -74,6 +87,7 @@ void Balance_Reset(Balance_t *b)
     b->integral = 0.0f;
     b->speed_integral = 0.0f;
     b->speed_filtered_cps = 0.0f;
+    b->speed_slow_cps = 0.0f;
     b->output_unclamped = 0.0f;
     b->output_pwm = 0.0f;
     b->stable_count = 0U;
@@ -109,6 +123,7 @@ void Balance_SetWheelSpeed(Balance_t *b, float speed_cps)
 
     alpha = clampf_local(b->speed_filter_alpha, 0.0f, 1.0f);
     b->speed_filtered_cps += alpha * (speed_cps - b->speed_filtered_cps);
+    b->speed_slow_cps += BAL_SPEED_SLOW_ALPHA * (speed_cps - b->speed_slow_cps);
 }
 
 Balance_Status_t Balance_Update(Balance_t *b,
@@ -157,13 +172,15 @@ Balance_Status_t Balance_Update(Balance_t *b,
     b->rate_dps = rate;
 
     /* Only safety cutoff kept: shut off motors when tilt exceeds angle_limit_deg (50 deg). */
-    if (fabsf(angle) > b->angle_limit_deg)
+    target = b->target_angle_deg + b->dynamic_trim_deg;
+    if (fabsf(angle - target) > b->angle_limit_deg)
     {
         b->status = BAL_FAULT_ANGLE;
         b->output_pwm = 0.0f;
         b->output_unclamped = 0.0f;
         b->integral = 0.0f;
         b->speed_integral = 0.0f;
+        b->speed_slow_cps = 0.0f;
         b->stable_count = 0U;
         b->stable = 0U;
         Motor_Disable(motor);
@@ -175,20 +192,47 @@ Balance_Status_t Balance_Update(Balance_t *b,
         Motor_Enable(motor);
     }
 
-    target = b->target_angle_deg;
+    /* Dynamic auto-trim: whenever the robot is upright and sustains a drift
+       or forward sprint, shift dynamic_trim_deg to pull it back to a stop. */
+    if (b->auto_trim_enabled && (b->auto_trim_ki > 0.0f) &&
+        (fabsf(angle - target) < 15.0f) && (fabsf(rate) < 100.0f))
+    {
+        float slow_err = b->speed_slow_cps - b->speed_target_cps;
+        if (fabsf(slow_err) > b->auto_trim_deadband_cps)
+        {
+            float effective_err = (slow_err > 0.0f)
+                                  ? (slow_err - b->auto_trim_deadband_cps)
+                                  : (slow_err + b->auto_trim_deadband_cps);
+            float trim_rate_dps = -b->angle_sign * b->auto_trim_ki * effective_err;
+            trim_rate_dps = clampf_local(trim_rate_dps,
+                                         -b->auto_trim_max_rate_dps,
+                                          b->auto_trim_max_rate_dps);
+            b->dynamic_trim_deg += trim_rate_dps * dt_s;
+            b->dynamic_trim_deg = clampf_local(b->dynamic_trim_deg,
+                                               -b->auto_trim_limit_deg,
+                                                b->auto_trim_limit_deg);
+            target = b->target_angle_deg + b->dynamic_trim_deg;
+        }
+    }
 
-    /* Outer speed loop is optional and OFF by default.
-       Encoders are normalized so positive speed_filtered_cps means rolling
-       forward, and angle_sign defines which angle sign is a forward lean.
-       To brake forward motion, target angle must shift backward
-       (-angle_sign * speed_adjust), independent of motor wiring output_sign. */
+    /* Outer speed loop.
+       Hardware-verified: positive speed_filtered_cps is in the +angle_sign
+       lean direction, so braking forward wheel speed shifts target backward
+       by -b->angle_sign * speed_adjust (negative feedback). */
     if (b->speed_loop_enabled)
     {
         float speed_error = b->speed_filtered_cps - b->speed_target_cps;
-        b->speed_integral += speed_error * dt_s;
-        b->speed_integral = clampf_local(b->speed_integral,
-                                         -b->speed_integral_limit,
-                                          b->speed_integral_limit);
+        if (b->speed_ki > 0.0f)
+        {
+            float max_int = b->speed_angle_limit_deg / b->speed_ki;
+            if (max_int > b->speed_integral_limit) max_int = b->speed_integral_limit;
+            b->speed_integral += speed_error * dt_s;
+            b->speed_integral = clampf_local(b->speed_integral, -max_int, max_int);
+        }
+        else
+        {
+            b->speed_integral = 0.0f;
+        }
         speed_adjust = b->speed_kp * speed_error + b->speed_ki * b->speed_integral;
         speed_adjust = clampf_local(speed_adjust,
                                     -b->speed_angle_limit_deg,
