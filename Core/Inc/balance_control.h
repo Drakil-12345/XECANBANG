@@ -57,6 +57,10 @@ typedef struct
     float speed_slow_cps;        /* heavily filtered speed (~0.5 s tau) */
     float dynamic_trim_deg;      /* learned offset added to target_angle_deg */
 
+    /* Steering from the remote: PWM added to the left wheel and subtracted
+       from the right wheel (positive = turn right). Set by main.c. */
+    float turn_pwm;
+
     /* Debug values: visible in Keil Live Expressions. */
     float angle_deg;
     float rate_dps;
