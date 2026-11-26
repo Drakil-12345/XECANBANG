@@ -64,6 +64,8 @@ void Balance_Init(Balance_t *b)
     b->speed_slow_cps = 0.0f;
     b->dynamic_trim_deg = 0.0f;
 
+    b->turn_pwm = 0.0f;
+
     b->angle_deg = 0.0f;
     b->rate_dps = 0.0f;
     b->angle_error_deg = 0.0f;
@@ -288,7 +290,17 @@ Balance_Status_t Balance_Update(Balance_t *b,
     b->output_pwm = output;
 
     pwm_command = (int32_t)((output >= 0.0f) ? (output + 0.5f) : (output - 0.5f));
-    Motor_SetBoth(motor, (int16_t)pwm_command, (int16_t)pwm_command);
+    {
+        /* Steering: differential PWM on top of the balance command. */
+        int32_t turn = (int32_t)(isfinite(b->turn_pwm) ? b->turn_pwm : 0.0f);
+        int32_t left = pwm_command + turn;
+        int32_t right = pwm_command - turn;
+        if (left > pwm_limit) left = pwm_limit;
+        if (left < -pwm_limit) left = -pwm_limit;
+        if (right > pwm_limit) right = pwm_limit;
+        if (right < -pwm_limit) right = -pwm_limit;
+        Motor_SetBoth(motor, (int16_t)left, (int16_t)right);
+    }
 
     b->update_count++;
     if ((fabsf(angle - target) < 2.0f) && (fabsf(rate) < 12.0f) &&

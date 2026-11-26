@@ -10,6 +10,7 @@
 #include "motor.h"
 #include "encoder.h"
 #include "balance_control.h"
+#include "remote.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,13 +23,13 @@ TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim9;
 
 /* ---------------------- Control timing -------------------------- */
-#define CONTROL_DT_S             0.004f
-#define CONTROL_RATE_HZ          250U
-#define IMU_STARTUP_ATTEMPTS     10U
+#define CONTROL_DT_S 0.004f
+#define CONTROL_RATE_HZ 250U
+#define IMU_STARTUP_ATTEMPTS 10U
 #define IMU_STARTUP_CALIB_SAMPLES 100U
-#define IMU_WARMUP_SAMPLES       50U
-#define IMU_RECONNECT_TICKS      50U   /* retry every 200 ms at 250 Hz */
-#define STATUS_LED_BLINK_TICKS   25U   /* toggle every 100 ms at 250 Hz (5 Hz) */
+#define IMU_WARMUP_SAMPLES 50U
+#define IMU_RECONNECT_TICKS 50U    /* retry every 200 ms at 250 Hz */
+#define STATUS_LED_BLINK_TICKS 25U /* toggle every 100 ms at 250 Hz (5 Hz) */
 
 /* ---------------------- Application objects --------------------- */
 MPU6050_Data_t g_imu;
@@ -51,21 +52,21 @@ volatile Balance_Status_t g_fault_code = BAL_FAULT_NOT_ARMED;
  * Robot starts armed automatically on power-on.
  * Only safety cutoff: motors disable when |angle| > g_angle_limit_deg (50 deg).
  */
-volatile uint8_t  g_arm_request = 0U;          /* write 1 to re-ARM after manual disarm */
-volatile uint8_t  g_disarm_request = 0U;       /* write 1 to DISARM */
-volatile uint8_t  g_clear_fault_request = 0U;  /* kept for Live Expressions compatibility */
-volatile uint8_t  g_calib_request = 0U;        /* write 1 while robot is still */
-volatile uint8_t  g_capture_target_request = 0U; /* write 1 at the balance point */
-volatile uint8_t  g_auto_arm_enable = 1U;      /* auto-run on power-on enabled */
+volatile uint8_t g_arm_request = 0U;            /* write 1 to re-ARM after manual disarm */
+volatile uint8_t g_disarm_request = 0U;         /* write 1 to DISARM */
+volatile uint8_t g_clear_fault_request = 0U;    /* kept for Live Expressions compatibility */
+volatile uint8_t g_calib_request = 0U;          /* write 1 while robot is still */
+volatile uint8_t g_capture_target_request = 0U; /* write 1 at the balance point */
+volatile uint8_t g_auto_arm_enable = 1U;        /* auto-run on power-on enabled */
 
 /* Starting gains for a small JGA25-370/TB6612 robot.
  * Tune with the wheels raised first, then on the ground:
  *   Kp too low -> falls; too high -> fast oscillation.
  *   Kd too low -> keeps oscillating; too high -> buzzing / jitter. */
-volatile float    g_kp = 800.0f;
-volatile float    g_kd = 21.0f;
-volatile float    g_ki = 0.0f;
-volatile float    g_target_angle_deg = 0.0f;
+volatile float g_kp = 800.0f;
+volatile float g_kd = 21.0f;
+volatile float g_ki = 0.0f;
+volatile float g_target_angle_deg = 3.5f;
 
 /* g_angle_sign only flips the telemetry/control convention.  The gyro sign
  * is tied to it automatically (rate must be d(angle)/dt).  To fix a robot
@@ -75,50 +76,62 @@ volatile float    g_target_angle_deg = 0.0f;
  * positive controller command drives the wheels opposite to a forward
  * lean, so the default is -1.  If you rewire/replace a motor or mount the
  * MPU differently, repeat README step 4 and set +1/-1 accordingly. */
-volatile float    g_angle_sign = 1.0f;
-volatile float    g_output_sign = -1.0f;
-volatile int32_t  g_pwm_limit = 7500;
-volatile float    g_angle_limit_deg = 50.0f;
-volatile float    g_rate_limit_dps = 700.0f;
+volatile float g_angle_sign = 1.0f;
+volatile float g_output_sign = -1.0f;
+volatile int32_t g_pwm_limit = 7500;
+volatile float g_angle_limit_deg = 50.0f;
+volatile float g_rate_limit_dps = 700.0f;
 
 /* Outer speed loop: fast P damping + separate slow dynamic auto-trim. */
-volatile uint8_t  g_speed_loop_enable = 1U;
-volatile float    g_speed_kp = 0.005f;   /* deg / (encoder count/s) */
-volatile float    g_speed_ki = 0.0f;     /* kept 0: dynamic auto-trim handles offset learning */
-volatile float    g_speed_target_cps = 0.0f;
-volatile float    g_speed_angle_limit_deg = 8.0f;
+volatile uint8_t g_speed_loop_enable = 1U;
+volatile float g_speed_kp = 0.005f; /* deg / (encoder count/s) */
+volatile float g_speed_ki = 0.0f;   /* kept 0: dynamic auto-trim handles offset learning */
+volatile float g_speed_target_cps = 0.0f;
+volatile float g_speed_angle_limit_deg = 6.0f;
 
 /* Dynamic balance-point auto-trim (self-adjusts target angle online). */
-volatile uint8_t  g_auto_trim_enable = 1U;
-volatile float    g_auto_trim_ki = 0.0018f;      /* deg / (count/s * s) */
-volatile float    g_auto_trim_limit_deg = 15.0f; /* max learned offset (+/- deg) */
-volatile float    g_dynamic_trim_deg = 0.0f;     /* debug: current learned offset */
+volatile uint8_t g_auto_trim_enable = 0U;     // Dang tat auto trim
+volatile float g_auto_trim_ki = 0.0018f;      /* deg / (count/s * s) */
+volatile float g_auto_trim_limit_deg = 15.0f; /* max learned offset (+/- deg) */
+volatile float g_dynamic_trim_deg = 0.0f;     /* debug: current learned offset */
+
+/* Wifi remote (ESP32 -> USART2 PA2/PA3). Joystick 100% maps to these values.
+ * Tune on the ground: max speed in encoder counts/s (read g_encoder_average_cps
+ * while pushing the robot at a comfortble pace), turn in PWM counts.
+ * Flip a sign if the robot goes backward / turns the wrong way.
+ * NOTE: while the remote is in use it overwrites g_speed_target_cps every tick. */
+volatile float g_cmd_speed_max_cps = 2200.0f;
+volatile float g_cmd_turn_max_pwm = 700.0f;
+volatile float g_cmd_speed_ramp_cps_s = 800.0f; /* acceleration limit */
+volatile float g_cmd_turn_ramp_pwm_s = 6000.0f;
+volatile float g_cmd_fwd_sign = 1.0f;
+volatile float g_cmd_turn_sign = -1.0f;
 
 /* Encoder direction normalisation (both positive when the robot rolls forward). */
-volatile uint8_t  g_encoder_left_invert = 1U;
-volatile uint8_t  g_encoder_right_invert = 0U;
+volatile uint8_t g_encoder_left_invert = 1U;
+volatile uint8_t g_encoder_right_invert = 0U;
 
 /* Motor correction: all zero initially.  min PWM is a floor for gearbox
  * friction; leave 0 until you have measured the real deadband. */
-volatile int32_t  g_trim_left = 0;
-volatile int32_t  g_trim_right = 0;
-volatile int32_t  g_min_pwm_left = 0;
-volatile int32_t  g_min_pwm_right = 0;
+volatile int32_t g_trim_left = 0;
+volatile int32_t g_trim_right = 0;
+volatile int32_t g_min_pwm_left = 0;
+volatile int32_t g_min_pwm_right = 0;
 
 /* Direct motor test: only with wheels raised and SYS_IDLE.
  * Set g_motor_test = +/-500; the enable is 1 by default for convenience. */
-volatile uint8_t  g_motor_test_enable = 1U;
-volatile int32_t  g_motor_test = 0;
+volatile uint8_t g_motor_test_enable = 1U;
+volatile int32_t g_motor_test = 0;
 
 /* ---------------------- Debug telemetry -------------------------- */
-volatile uint8_t  g_imu_read_ok = 0U;
+volatile uint8_t g_imu_read_ok = 0U;
 volatile uint32_t g_imu_fail_count = 0U;
 volatile uint32_t g_tick_overrun_count = 0U;
 volatile uint32_t g_control_tick_count = 0U;
-volatile float    g_debug_dt_s = CONTROL_DT_S;
-volatile float    g_encoder_left_cps = 0.0f;
-volatile float    g_encoder_right_cps = 0.0f;
-volatile float    g_encoder_average_cps = 0.0f;
+volatile float g_debug_dt_s = CONTROL_DT_S;
+volatile float g_encoder_left_cps = 0.0f;
+volatile float g_encoder_right_cps = 0.0f;
+volatile float g_encoder_average_cps = 0.0f;
 volatile uint16_t g_auto_arm_count = 0U;
 
 /* Timer ISR only posts events. No I2C, PID or motor operations in the ISR. */
@@ -144,20 +157,25 @@ static void process_motor_test(void);
 static void warmup_imu_filter(void);
 static bool recalibrate_imu(void);
 static void run_one_control_tick(void);
+static void process_remote_command(void);
 volatile uint32_t g_reset_flags = 0U;
 
 /* ---------------------- Small utilities --------------------------- */
 static int16_t clamp_to_i16(int32_t value)
 {
-    if (value > INT16_MAX) value = INT16_MAX;
-    if (value < INT16_MIN) value = INT16_MIN;
+    if (value > INT16_MAX)
+        value = INT16_MAX;
+    if (value < INT16_MIN)
+        value = INT16_MIN;
     return (int16_t)value;
 }
 
 static uint16_t clamp_to_u16(int32_t value, uint16_t maximum)
 {
-    if (value < 0) value = 0;
-    if (value > (int32_t)maximum) value = maximum;
+    if (value < 0)
+        value = 0;
+    if (value > (int32_t)maximum)
+        value = maximum;
     return (uint16_t)value;
 }
 
@@ -290,7 +308,8 @@ static void warmup_imu_filter(void)
 
     for (uint16_t i = 0U; i < IMU_WARMUP_SAMPLES; i++)
     {
-        if (!MPU6050_Update(&g_imu, CONTROL_DT_S)) break;
+        if (!MPU6050_Update(&g_imu, CONTROL_DT_S))
+            break;
         acc_sum += g_imu.angle_acc_raw;
         acc_count++;
         HAL_Delay(4U);
@@ -307,7 +326,8 @@ static bool recalibrate_imu(void)
 {
     bool ok;
 
-    if (g_balance.armed) return false;
+    if (g_balance.armed)
+        return false;
 
     Motor_Disable(&g_motor);
     (void)HAL_TIM_Base_Stop_IT(&htim6);
@@ -328,6 +348,49 @@ static bool recalibrate_imu(void)
     return ok && g_imu.valid;
 }
 
+/* Turns the joystick command into a ramped speed target and a steering offset.
+ * Fail-safe: no fresh command (link lost) or not running -> goal 0. */
+static void process_remote_command(void)
+{
+    static float speed_cmd = 0.0f;
+    static float turn_cmd = 0.0f;
+    Remote_Cmd_t rc;
+    float speed_goal;
+    float turn_goal;
+    float step;
+    float diff;
+
+    Remote_GetCommand(&rc, HAL_GetTick());
+
+    if ((g_state != SYS_RUN) || !g_balance.armed)
+    {
+        rc.fwd = 0;
+        rc.turn = 0;
+    }
+
+    speed_goal = (float)rc.fwd * 0.01f * g_cmd_speed_max_cps * g_cmd_fwd_sign;
+    turn_goal = (float)rc.turn * 0.01f * g_cmd_turn_max_pwm * g_cmd_turn_sign;
+
+    step = fabsf(g_cmd_speed_ramp_cps_s) * CONTROL_DT_S;
+    diff = speed_goal - speed_cmd;
+    if (diff > step)
+        diff = step;
+    if (diff < -step)
+        diff = -step;
+    speed_cmd += diff;
+
+    step = fabsf(g_cmd_turn_ramp_pwm_s) * CONTROL_DT_S;
+    diff = turn_goal - turn_cmd;
+    if (diff > step)
+        diff = step;
+    if (diff < -step)
+        diff = -step;
+    turn_cmd += diff;
+
+    g_speed_target_cps = speed_cmd;
+    g_balance.turn_pwm = turn_cmd;
+}
+
 static void run_one_control_tick(void)
 {
     static uint16_t imu_retry_div = 0U;
@@ -336,6 +399,19 @@ static void run_one_control_tick(void)
 
     g_control_tick_count++;
     g_debug_dt_s = CONTROL_DT_S;
+
+    /* Wifi remote: parse ESP32 lines, then derive speed target / steering.
+       Must run before apply_debug_configuration() so new values apply this tick. */
+    Remote_Poll(HAL_GetTick());
+    process_remote_command();
+
+    /* 10 Hz telemetry to the ESP32 web page. */
+    if ((g_control_tick_count % 25U) == 0U)
+    {
+        Remote_SendTelemetry(g_balance.angle_deg, g_encoder_average_cps,
+                             (uint8_t)g_state, (uint8_t)g_fault_code,
+                             g_balance.dynamic_trim_deg);
+    }
 
     apply_debug_configuration();
 
@@ -425,7 +501,10 @@ static void run_one_control_tick(void)
     if (g_arm_request != 0U)
     {
         g_arm_request = 0U;
-        (void)try_arm();
+        if (g_state != SYS_RUN) /* ignore a stray ARM while already balancing */
+        {
+            (void)try_arm();
+        }
     }
 
     /* 4) Inner balance controller.
@@ -483,7 +562,8 @@ int main(void)
     for (uint8_t attempt = 0U; (attempt < IMU_STARTUP_ATTEMPTS) && !imu_ok; attempt++)
     {
         imu_ok = MPU6050_Init(&hi2c2, &g_imu);
-        if (!imu_ok) HAL_Delay(50U);
+        if (!imu_ok)
+            HAL_Delay(50U);
     }
 
     if (imu_ok)
@@ -494,6 +574,10 @@ int main(void)
 
     /* Auto-start immediately on power-on (only cutoff is |angle| > 50 deg). */
     (void)try_arm();
+
+    /* Start the ESP32 link last, so bytes sent during IMU calibration are not
+       replayed as stale commands. */
+    Remote_Init();
 
     /* TIM6 clock = 84 MHz (APB1 timer clock), PSC=83 -> 1 MHz,
        ARR=3999 -> exactly 250 Hz. */
@@ -541,7 +625,8 @@ void SystemClock_Config(void)
     osc.PLL.PLLN = 336;
     osc.PLL.PLLP = RCC_PLLP_DIV2;
     osc.PLL.PLLQ = 4;
-    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+        Error_Handler();
 
     clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                     RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
@@ -549,7 +634,8 @@ void SystemClock_Config(void)
     clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
     clk.APB1CLKDivider = RCC_HCLK_DIV4;
     clk.APB2CLKDivider = RCC_HCLK_DIV2;
-    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_I2C2_Init(void)
@@ -563,7 +649,8 @@ static void MX_I2C2_Init(void)
     hi2c2.Init.OwnAddress2 = 0U;
     hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
     hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c2) != HAL_OK) Error_Handler();
+    if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_TIM2_Init(void)
@@ -587,11 +674,13 @@ static void MX_TIM2_Init(void)
     encoder.IC2Selection = TIM_ICSELECTION_DIRECTTI;
     encoder.IC2Prescaler = TIM_ICPSC_DIV1;
     encoder.IC2Filter = 8U;
-    if (HAL_TIM_Encoder_Init(&htim2, &encoder) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Encoder_Init(&htim2, &encoder) != HAL_OK)
+        Error_Handler();
 
     master.MasterOutputTrigger = TIM_TRGO_RESET;
     master.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &master) != HAL_OK) Error_Handler();
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &master) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_TIM3_Init(void)
@@ -615,11 +704,13 @@ static void MX_TIM3_Init(void)
     encoder.IC2Selection = TIM_ICSELECTION_DIRECTTI;
     encoder.IC2Prescaler = TIM_ICPSC_DIV1;
     encoder.IC2Filter = 8U;
-    if (HAL_TIM_Encoder_Init(&htim3, &encoder) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Encoder_Init(&htim3, &encoder) != HAL_OK)
+        Error_Handler();
 
     master.MasterOutputTrigger = TIM_TRGO_RESET;
     master.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &master) != HAL_OK) Error_Handler();
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &master) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_TIM6_Init(void)
@@ -631,11 +722,13 @@ static void MX_TIM6_Init(void)
     htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim6.Init.Period = 3999U;
     htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim6) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+        Error_Handler();
 
     master.MasterOutputTrigger = TIM_TRGO_RESET;
     master.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &master) != HAL_OK) Error_Handler();
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &master) != HAL_OK)
+        Error_Handler();
 
     HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1U, 0U);
     HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
@@ -652,18 +745,23 @@ static void MX_TIM9_Init(void)
     htim9.Init.Period = MOTOR_PWM_ABS_MAX;
     htim9.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim9) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Base_Init(&htim9) != HAL_OK)
+        Error_Handler();
 
     clock.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim9, &clock) != HAL_OK) Error_Handler();
-    if (HAL_TIM_PWM_Init(&htim9) != HAL_OK) Error_Handler();
+    if (HAL_TIM_ConfigClockSource(&htim9, &clock) != HAL_OK)
+        Error_Handler();
+    if (HAL_TIM_PWM_Init(&htim9) != HAL_OK)
+        Error_Handler();
 
     pwm.OCMode = TIM_OCMODE_PWM1;
     pwm.Pulse = 0U;
     pwm.OCPolarity = TIM_OCPOLARITY_HIGH;
     pwm.OCFastMode = TIM_OCFAST_DISABLE;
-    if (HAL_TIM_PWM_ConfigChannel(&htim9, &pwm, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim9, &pwm, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim9, &pwm, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim9, &pwm, TIM_CHANNEL_2) != HAL_OK)
+        Error_Handler();
 
     HAL_TIM_MspPostInit(&htim9);
 }
@@ -705,7 +803,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
-        if (g_pending_ticks < 255U) g_pending_ticks++;
+        if (g_pending_ticks < 255U)
+            g_pending_ticks++;
     }
 }
 
@@ -718,7 +817,9 @@ void Error_Handler(void)
     while (1)
     {
         STATUS_LED_GPIO_Port->ODR ^= STATUS_LED_Pin;
-        for (volatile uint32_t i = 0U; i < 2000000U; i++) { }
+        for (volatile uint32_t i = 0U; i < 2000000U; i++)
+        {
+        }
     }
 }
 
